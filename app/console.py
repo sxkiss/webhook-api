@@ -17,6 +17,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+import re
 from base64 import b64decode, b64encode
 from pathlib import Path
 from typing import Any, Optional
@@ -44,7 +45,7 @@ ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
 ROLE_LABEL = {"viewer": "只读", "operator": "操作员", "admin": "管理员"}
 WINDOWS = {"1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800}
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("WEBHOOK_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 ONLINE_WINDOW = 300          # 5 分钟内算在线
 ACTIVE_WINDOW = 3600         # 1 小时内算活跃
 SESSION_SECRET_KEY = "session_secret"
@@ -53,9 +54,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "site_name": "Webhook 中继台",
     "default_window": "24h",
     "refresh_ms": 4000,
+    "pair_window": 60,
     "show_inferred": True,
     "notices": [],
     "rules": [],
+    "muse_actions": {},
 }
 
 _STATE: dict[str, Any] = {
@@ -68,6 +71,32 @@ _STATE: dict[str, Any] = {
     "ready": False,
 }
 _login_fails: dict[str, list[float]] = {}
+_waiters: set[asyncio.Event] = set()
+_last_legacy_sync: float = 0.0
+
+
+def notify_new_message() -> None:
+    """唤醒所有等待新消息的 SSE / 轮询协程，并标记 legacy 通道需重新同步。"""
+    global _last_legacy_sync
+    _last_legacy_sync = 0.0
+    for ev in list(_waiters):
+        try:
+            ev.set()
+        except Exception:
+            pass
+
+
+async def wait_for_message(timeout: float = 2.0) -> bool:
+    """等待新消息通知，超时返回 False，收到通知返回 True。"""
+    ev = asyncio.Event()
+    _waiters.add(ev)
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=max(0.05, timeout))
+        return True
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        _waiters.discard(ev)
 
 
 # ─── 初始化 ─────────────────────────────────────────────────────────────────
@@ -92,6 +121,7 @@ def configure(storage_dir: str | Path, api_key: str = "", allow_no_auth: bool = 
     )
     _init_db()
     _bootstrap_admin()
+    _legacy_sync()
 
 
 def _conn() -> sqlite3.Connection:
@@ -157,8 +187,52 @@ def _init_db() -> None:
                 k TEXT PRIMARY KEY,
                 v TEXT
             );
+            CREATE TABLE IF NOT EXISTS muse_instances (
+                instance_id TEXT PRIMARY KEY,
+                channel_id TEXT UNIQUE NOT NULL,
+                display_name TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                legacy INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS wechat_routes (
+                route_id TEXT PRIMARY KEY,
+                wx_account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                conversation_type TEXT NOT NULL DEFAULT 'direct',
+                instance_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(wx_account_id, conversation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wechat_routes_instance ON wechat_routes(instance_id);
             """
         )
+        # 旧微信路由升级为多平台唯一键，事务内保留原有 ID 和绑定状态。
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(wechat_routes)")}
+        if "platform" not in columns:
+            conn.execute("ALTER TABLE wechat_routes RENAME TO wechat_routes_legacy")
+            conn.execute("""CREATE TABLE wechat_routes (
+                route_id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL DEFAULT 'wechat',
+                wx_account_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                conversation_type TEXT NOT NULL DEFAULT 'direct',
+                instance_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(platform, wx_account_id, conversation_id)
+            )""")
+            conn.execute("""INSERT INTO wechat_routes
+                SELECT route_id, 'wechat', wx_account_id, conversation_id,
+                       conversation_type, instance_id, enabled, created_at, updated_at
+                FROM wechat_routes_legacy""")
+            conn.execute("DROP TABLE wechat_routes_legacy")
+            conn.execute("CREATE INDEX idx_wechat_routes_instance ON wechat_routes(instance_id)")
         conn.commit()
     finally:
         conn.close()
@@ -167,9 +241,6 @@ def _init_db() -> None:
         _exec("ALTER TABLE console_users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
-    # 旧库升级：信箱的「删除水位线」与「人工固定」
-    # deleted_at：手动删除信箱的时间点。消息时间晚于它才算「又有通信」，信箱才会重新出现。
-    # pinned：人工恢复/人工新建的标注，即使没有任何消息也保持可见。
     for ddl in (
         "ALTER TABLE console_agents ADD COLUMN deleted_at REAL",
         "ALTER TABLE console_agents ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
@@ -402,14 +473,7 @@ def _status_of(last_ts: Optional[float], now: float) -> str:
 
 
 def _discover_agents() -> tuple[list[dict], dict[str, dict]]:
-    """从 messages 动态发现信箱，叠加人工标注。不依赖任何手写名单。
-
-    返回「全部」信箱，每项带 state（可见性）：
-      visible  正常显示
-      deleted  被手动删除，且删除后没有新通信 —— 仍在返回值里，供界面「恢复」用
-      empty    收和发都没有任何消息（空壳标注）—— 自动忽略
-    调用方自行按 state 过滤；_collect_agents 只给可见的那批。
-    """
+    """发现全部信箱，附带 visible/deleted/empty 状态，供界面决定显示范围。"""
     now = time.time()
     rows = _q_all(
         """
@@ -448,30 +512,41 @@ def _discover_agents() -> tuple[list[dict], dict[str, dict]]:
             "total": 0, "recent": 0, "first_ts": None, "last_ts": None,
         })
 
+    # 注册中心里已登记但还没有消息的 Muse 通道也列出来
+    muses_by_channel: dict[str, dict] = {}
+    try:
+        for mrow in _q_all("SELECT * FROM muse_instances"):
+            ch = mrow["channel_id"]
+            muses_by_channel[ch] = dict(mrow)
+            found.setdefault(ch, {
+                "name": ch, "inbound": 0, "outbound": 0,
+                "total": 0, "recent": 0, "first_ts": mrow["created_at"], "last_ts": None,
+            })
+    except Exception:
+        pass
+
     agents = []
     for name, item in found.items():
         meta = ann.get(name, {})
-        deleted_at = meta.get("deleted_at")
-        state = "visible"
-
-        if deleted_at:
-            last_ts = item["last_ts"] or 0
-            if last_ts > deleted_at:
-                # 删除之后又有通信了：自动复活，水位线清掉
-                _exec("UPDATE console_agents SET deleted_at = NULL WHERE name = ?", (name,))
-            else:
-                state = "deleted"
-
-        item["display_name"] = meta.get("display_name") or name
-        item["role"] = meta.get("role") or ""
+        mreg = muses_by_channel.get(name)
+        item["display_name"] = meta.get("display_name") or (mreg.get("display_name") if mreg else None) or name
+        item["role"] = meta.get("role") or ("Muse 通道" if mreg else "")
         item["note"] = meta.get("note") or ""
         item["color"] = meta.get("color") or ""
         item["avatar"] = _avatar_url(name, meta)
         item["has_custom_avatar"] = bool(meta.get("avatar"))
         item["status"] = _status_of(item["last_ts"], now)
+        item["instance_id"] = mreg["instance_id"] if mreg else None
+        item["registry_status"] = mreg["status"] if mreg else None
+        deleted_at = meta.get("deleted_at")
+        state = "visible"
+        if deleted_at:
+            if (item["last_ts"] or 0) > deleted_at:
+                _exec("UPDATE console_agents SET deleted_at = NULL WHERE name = ?", (name,))
+            else:
+                state = "deleted"
         item["pinned"] = bool(meta.get("pinned"))
         item["deleted_at"] = None if state == "visible" and deleted_at else deleted_at
-        # 收和发都没有信息 → 自动忽略。人工固定（pinned）过的除外。
         if state == "visible" and item["total"] == 0 and not item["pinned"]:
             state = "empty"
         item["state"] = state
@@ -482,7 +557,6 @@ def _discover_agents() -> tuple[list[dict], dict[str, dict]]:
 
 
 def _collect_agents() -> tuple[list[dict], dict[str, dict]]:
-    """只要可见信箱（KPI、通信台、大屏都用这个口径）。"""
     agents, ann = _discover_agents()
     return [a for a in agents if a["state"] == "visible"], ann
 
@@ -521,8 +595,8 @@ def build_lineage(
     """
     ins: list[dict] = []
     outs: list[dict] = []
-    # 控制台发出的消息：语义上是 console → 该信箱。
-    # 新数据是 inbound（人发给信箱），早期数据是 outbound（当时写错了方向）。
+    # 控制台发出的消息语义是 console → 信箱。
+    # 现在统一写 inbound；早期版本可能写成 outbound，需要兼容两种历史数据。
     console_ins: list[dict] = []
 
     for row in rows:
@@ -540,7 +614,7 @@ def build_lineage(
         }
         if row["direction"] == "inbound":
             if item["via"] == "console":
-                console_ins.append(item)      # 控制台发的，不当成「外部进来」
+                console_ins.append(item)
             else:
                 ins.append(item)
         else:
@@ -577,9 +651,9 @@ def build_lineage(
             by_rid_out.setdefault(item["rid"], []).append(item)
 
     handled_out: set[str] = set()
+    handled_in: set[str] = set()
 
-    # 控制台发出去的：一条边 console → 信箱；同时记住 request_id，
-    # 这样信箱的回复能配回 console，而不是被当成「中继匿名转发」。
+    # 控制台消息先画出 console → 信箱，并用 request_id 关联信箱回复。
     console_rid: dict[str, str] = {}
     for c in console_ins:
         add_edge("console", c["name"], 1.0, c["ts"], c["id"], "rid")
@@ -635,6 +709,12 @@ def build_lineage(
         conf = 0.6 if len(rivals) == 1 else 0.35
         add_edge(nearest["name"], out["name"], conf, out["ts"], out["id"], "window")
 
+    # 控制台消息已单独处理；其余未配对入站消息汇聚到中继核心。
+    for inbound in ins:
+        if inbound["id"] in handled_in:
+            continue
+        add_edge(inbound["name"], "relay", 0.9, inbound["ts"], inbound["id"], "inbound")
+
     # 节点聚合：窗口内出现过的信箱都要有，孤立节点也画出来
     node_stats: dict[str, dict] = {}
 
@@ -686,10 +766,20 @@ def build_lineage(
         stats["degree"] = sum(
             1 for e in edge_list if e["from"] == name or e["to"] == name
         )
-        stats["display_name"] = meta.get("display_name") or name
+        stats["display_name"] = meta.get("display_name") or (
+            "中继核心" if name == "relay" else ("控制台" if name == "console" else name)
+        )
         stats["role"] = meta.get("role") or ""
         stats["avatar"] = _avatar_url(name, meta)
         stats["status"] = _status_of(stats["last_ts"] or None, now)
+        stats["peers_out"] = [
+            {"to": e["to"], "count": e["count"], "inferred": e["inferred"]}
+            for e in sorted(edge_list, key=lambda x: -x["count"]) if e["from"] == name
+        ]
+        stats["peers_in"] = [
+            {"from": e["from"], "count": e["count"], "inferred": e["inferred"]}
+            for e in sorted(edge_list, key=lambda x: -x["count"]) if e["to"] == name
+        ]
         nodes.append(stats)
 
     nodes.sort(key=lambda n: (-n["volume"], n["name"]))
@@ -759,10 +849,49 @@ class AgentPatch(BaseModel):
 
 class SendIn(BaseModel):
     name: str
-    content: str
+    content: Optional[str] = ""
     type: str = "text"
     media_url: Optional[str] = None
     request_id: Optional[str] = None
+    direction: str = "inbound"
+
+
+class MuseRegisterIn(BaseModel):
+    instance_id: str
+    display_name: Optional[str] = None
+    capabilities: list[str] = []
+
+
+class MusePatchIn(BaseModel):
+    display_name: Optional[str] = None
+    status: Optional[str] = None
+
+
+class RouteBindIn(BaseModel):
+    platform: str = "wechat"
+    account_id: Optional[str] = None
+    wx_account_id: Optional[str] = None
+    conversation_id: str
+    conversation_type: str = "direct"
+    instance_id: Optional[str] = None
+    channel_id: Optional[str] = None
+
+
+class RoutePatchIn(BaseModel):
+    enabled: Optional[bool] = None
+    conversation_type: Optional[str] = None
+    instance_id: Optional[str] = None
+    channel_id: Optional[str] = None
+
+
+class RouteResolveIn(BaseModel):
+    platform: str = "wechat"
+    account_id: Optional[str] = None
+    wx_account_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+
+
+registry_router = APIRouter(prefix="/api/registry", tags=["registry"])
 
 
 # ─── 路由 ───────────────────────────────────────────────────────────────────
@@ -770,22 +899,368 @@ class SendIn(BaseModel):
 router = APIRouter(prefix="/api/console", tags=["console"])
 
 
+def _legacy_sync(force: bool = False) -> None:
+    """把旧的 muse1号/muse2号 等历史通道登记为已分配，不改历史消息。
+    采用单事务批量写入 + 节流，避免每次查询重复扫描全表。
+    """
+    global _last_legacy_sync
+    now = time.time()
+    if not force and (now - _last_legacy_sync) < 15.0:
+        return
+    _last_legacy_sync = now
+    conn = _conn()
+    try:
+        msg_names = {
+            str(r["name"])
+            for r in conn.execute("SELECT DISTINCT name FROM messages WHERE name LIKE 'muse%号'").fetchall()
+        }
+        agent_names = {
+            str(r["name"])
+            for r in conn.execute("SELECT name FROM console_agents WHERE name LIKE 'muse%号'").fetchall()
+        }
+        candidates = [
+            (f"legacy-{name}", name, name, now, now)
+            for name in sorted(msg_names | agent_names)
+            if re.fullmatch(r"muse\d+号", name)
+        ]
+        if candidates:
+            conn.executemany(
+                "INSERT OR IGNORE INTO muse_instances (instance_id, channel_id, display_name, legacy, created_at, last_seen_at) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                candidates,
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _resolve_instance(instance_id: Optional[str], channel_id: Optional[str], require_active: bool = True) -> sqlite3.Row:
+    _legacy_sync()
+    row = None
+    if instance_id:
+        row = _q("SELECT * FROM muse_instances WHERE instance_id = ?", (instance_id.strip(),))
+    if row is None and channel_id:
+        row = _q("SELECT * FROM muse_instances WHERE channel_id = ?", (channel_id.strip(),))
+    if row is None:
+        raise HTTPException(404, "Muse 未注册")
+    if require_active and row["status"] != "active":
+        raise HTTPException(409, "Muse 已停用")
+    return row
+
+
+def _next_channel_id() -> str:
+    _legacy_sync(force=True)
+    rows = _q_all("SELECT channel_id FROM muse_instances")
+    used = {int(m.group(1)) for r in rows if (m := re.fullmatch(r"muse(\d+)号", str(r["channel_id"])))}
+    n = 1
+    while n in used:
+        n += 1
+    return f"muse{n}号"
+
+
+@registry_router.get("/muses")
+@registry_router.get("/muse")
+def registry_list_muses(user: dict = Depends(need("viewer"))) -> dict:
+    """列出所有已注册（含 legacy 自动发现）的 Muse 实例及绑定路由数与消息量。"""
+    _legacy_sync()
+    rows = _q_all(
+        """
+        SELECT m.*,
+               COUNT(DISTINCT r.route_id) AS route_count,
+               SUM(CASE WHEN r.enabled = 1 THEN 1 ELSE 0 END) AS active_route_count
+        FROM muse_instances m
+        LEFT JOIN wechat_routes r ON r.instance_id = m.instance_id
+        GROUP BY m.instance_id
+        ORDER BY m.created_at ASC
+        """
+    )
+    msg_stats = {
+        r["name"]: dict(r)
+        for r in _q_all(
+            """
+            SELECT name,
+                   SUM(CASE WHEN direction = 'inbound' THEN 1 ELSE 0 END) AS inbound,
+                   SUM(CASE WHEN direction = 'outbound' THEN 1 ELSE 0 END) AS outbound,
+                   COUNT(*) AS total,
+                   MAX(timestamp) AS last_msg_ts
+            FROM messages
+            WHERE name IS NOT NULL AND name != ''
+            GROUP BY name
+            """
+        )
+    }
+    muses = []
+    for r in rows:
+        item = dict(r)
+        item["legacy"] = bool(item.get("legacy"))
+        item["route_count"] = int(item.get("route_count") or 0)
+        item["active_route_count"] = int(item.get("active_route_count") or 0)
+        st = msg_stats.get(item["channel_id"], {})
+        item["inbound"] = int(st.get("inbound") or 0)
+        item["outbound"] = int(st.get("outbound") or 0)
+        item["total"] = int(st.get("total") or 0)
+        item["last_msg_ts"] = st.get("last_msg_ts")
+        muses.append(item)
+    return {"ok": True, "muses": muses, "count": len(muses)}
+
+
+@registry_router.post("/muse/register")
+def registry_register(body: MuseRegisterIn, user: dict = Depends(need("operator"))) -> dict:
+    instance_id = body.instance_id.strip()
+    if not re.fullmatch(r"\S{3,128}", instance_id):
+        raise HTTPException(400, "instance_id 格式无效（需 3-128 位非空字符）")
+    existing = _q("SELECT * FROM muse_instances WHERE instance_id = ?", (instance_id,))
+    now = time.time()
+    if existing:
+        disp = body.display_name.strip() if body.display_name and body.display_name.strip() else None
+        _exec(
+            "UPDATE muse_instances SET last_seen_at = ?, display_name = COALESCE(?, display_name) WHERE instance_id = ?",
+            (now, disp, instance_id),
+        )
+        return {
+            "ok": True,
+            "instance_id": instance_id,
+            "channel_id": existing["channel_id"],
+            "status": existing["status"],
+            "legacy": bool(existing["legacy"]),
+            "idempotent": True,
+        }
+    channel_id = _next_channel_id()
+    disp = (body.display_name or "").strip() or channel_id
+    _exec(
+        "INSERT INTO muse_instances (instance_id, channel_id, display_name, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+        (instance_id, channel_id, disp, now, now),
+    )
+    return {
+        "ok": True,
+        "instance_id": instance_id,
+        "channel_id": channel_id,
+        "status": "active",
+        "legacy": False,
+        "idempotent": False,
+    }
+
+
+@registry_router.get("/muse/{instance_id}")
+def registry_get(instance_id: str, user: dict = Depends(need("viewer"))) -> dict:
+    row = _resolve_instance(instance_id, None, require_active=False)
+    return {"ok": True, "muse": dict(row)}
+
+
+@registry_router.patch("/muse/{instance_id}")
+def registry_patch_muse(instance_id: str, body: MusePatchIn, user: dict = Depends(need("operator"))) -> dict:
+    row = _resolve_instance(instance_id, None, require_active=False)
+    fields, params = [], []
+    if body.display_name is not None:
+        fields.append("display_name = ?")
+        params.append(body.display_name.strip() or row["channel_id"])
+    if body.status is not None:
+        st = body.status.strip().lower()
+        if st not in {"active", "disabled"}:
+            raise HTTPException(400, "status 仅支持 active 或 disabled")
+        fields.append("status = ?")
+        params.append(st)
+    if fields:
+        params.append(row["instance_id"])
+        _exec(f"UPDATE muse_instances SET {', '.join(fields)} WHERE instance_id = ?", tuple(params))
+    updated = _q("SELECT * FROM muse_instances WHERE instance_id = ?", (row["instance_id"],))
+    return {"ok": True, "muse": dict(updated)}
+
+
+@registry_router.delete("/muse/{instance_id}")
+def registry_delete_muse(instance_id: str, user: dict = Depends(need("admin"))) -> dict:
+    row = _resolve_instance(instance_id, None, require_active=False)
+    _exec("DELETE FROM wechat_routes WHERE instance_id = ?", (row["instance_id"],))
+    _exec("DELETE FROM muse_instances WHERE instance_id = ?", (row["instance_id"],))
+    return {"ok": True}
+
+
+@registry_router.post("/routes/bind")
+def registry_bind(body: RouteBindIn, user: dict = Depends(need("operator"))) -> dict:
+    platform, wx = _route_identity(body.platform, body.account_id, body.wx_account_id)
+    conversation = body.conversation_id.strip()
+    kind = body.conversation_type.strip().lower()
+    if not wx or not conversation or kind not in {"direct", "group"}:
+        raise HTTPException(400, "账号、会话 ID 或会话类型无效")
+    muse = _resolve_instance(body.instance_id, body.channel_id)
+    route_id = f"route-{secrets.token_hex(10)}"
+    now = time.time()
+    _exec(
+        "INSERT INTO wechat_routes (route_id, platform, wx_account_id, conversation_id, conversation_type, instance_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(platform, wx_account_id, conversation_id) DO UPDATE SET "
+        "conversation_type=excluded.conversation_type, instance_id=excluded.instance_id, enabled=1, updated_at=excluded.updated_at",
+        (route_id, platform, wx, conversation, kind, muse["instance_id"], now, now),
+    )
+    row = _q(
+        "SELECT r.*, m.channel_id, m.display_name AS muse_display_name, m.status AS muse_status "
+        "FROM wechat_routes r JOIN muse_instances m ON m.instance_id = r.instance_id "
+        "WHERE r.platform = ? AND r.wx_account_id = ? AND r.conversation_id = ?",
+        (platform, wx, conversation),
+    )
+    return {"ok": True, "route": _route_dict(row), "channel_id": muse["channel_id"]}
+
+
+@registry_router.get("/routes")
+def registry_routes(wx_account_id: Optional[str] = None, user: dict = Depends(need("viewer")),
+                    platform: Optional[str] = None, account_id: Optional[str] = None) -> dict:
+    _legacy_sync()
+    filters, params = [], []
+    if platform is not None or wx_account_id:
+        platform, _ = _route_identity(platform or "wechat", account_id, wx_account_id)
+        filters.append("r.platform = ?")
+        params.append(platform)
+    account = account_id or wx_account_id
+    if account:
+        filters.append("r.wx_account_id = ?")
+        params.append(account.strip())
+    where = " WHERE " + " AND ".join(filters) if filters else ""
+    rows = _q_all(
+        "SELECT r.*, m.channel_id, m.display_name AS muse_display_name, m.status AS muse_status "
+        "FROM wechat_routes r JOIN muse_instances m ON m.instance_id=r.instance_id "
+        + where + " ORDER BY r.updated_at DESC", tuple(params),
+    )
+    return {"ok": True, "routes": [_route_dict(r) for r in rows]}
+
+
+@registry_router.patch("/routes/{route_id}")
+def registry_patch_route(route_id: str, body: RoutePatchIn, user: dict = Depends(need("operator"))) -> dict:
+    row = _q("SELECT * FROM wechat_routes WHERE route_id = ?", (route_id,))
+    if not row:
+        raise HTTPException(404, "路由不存在")
+    fields, params = [], []
+    if body.enabled is not None:
+        fields.append("enabled = ?")
+        params.append(1 if body.enabled else 0)
+    if body.conversation_type is not None:
+        kind = body.conversation_type.strip().lower()
+        if kind not in {"direct", "group"}:
+            raise HTTPException(400, "会话类型只能是 direct 或 group")
+        fields.append("conversation_type = ?")
+        params.append(kind)
+    if body.instance_id or body.channel_id:
+        muse = _resolve_instance(body.instance_id, body.channel_id)
+        fields.append("instance_id = ?")
+        params.append(muse["instance_id"])
+    if fields:
+        fields.append("updated_at = ?")
+        params.append(time.time())
+        params.append(route_id)
+        _exec(f"UPDATE wechat_routes SET {', '.join(fields)} WHERE route_id = ?", tuple(params))
+    updated = _q(
+        "SELECT r.*, m.channel_id, m.display_name AS muse_display_name, m.status AS muse_status "
+        "FROM wechat_routes r JOIN muse_instances m ON m.instance_id=r.instance_id "
+        "WHERE r.route_id = ?",
+        (route_id,),
+    )
+    return {"ok": True, "route": _route_dict(updated)}
+
+
+@registry_router.delete("/routes/{route_id}")
+def registry_delete_route(route_id: str, user: dict = Depends(need("operator"))) -> dict:
+    deleted = _exec("DELETE FROM wechat_routes WHERE route_id = ?", (route_id,))
+    if not deleted:
+        raise HTTPException(404, "路由不存在")
+    return {"ok": True}
+
+
+def _route_identity(platform: str, account_id: Optional[str], wx_account_id: Optional[str]) -> tuple[str, str]:
+    platform = (platform or "").strip().lower()
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", platform):
+        raise HTTPException(400, "平台标识需为 1–32 位小写字母、数字、下划线或连字符")
+    if account_id and wx_account_id and account_id.strip() != wx_account_id.strip():
+        raise HTTPException(400, "account_id 与 wx_account_id 不一致")
+    return platform, (account_id or wx_account_id or "").strip()
+
+
+def _route_dict(row) -> dict:
+    result = dict(row)
+    result["account_id"] = result["wx_account_id"]
+    return result
+
+
+def _do_resolve_route(wx_account_id: str, conversation_id: str, platform: str = "wechat") -> dict:
+    platform, _ = _route_identity(platform, wx_account_id, None)
+    wx = (wx_account_id or "").strip()
+    conv = (conversation_id or "").strip()
+    if not wx or not conv:
+        raise HTTPException(400, "缺少 account_id 或 conversation_id")
+    row = _q(
+        "SELECT r.*, m.channel_id, m.display_name AS muse_display_name, m.status "
+        "FROM wechat_routes r JOIN muse_instances m ON m.instance_id=r.instance_id "
+        "WHERE r.platform = ? AND r.wx_account_id = ? AND r.conversation_id = ? AND r.enabled = 1",
+        (platform, wx, conv),
+    )
+    if not row or row["status"] != "active":
+        raise HTTPException(404, "该平台会话未绑定可用 Muse")
+    return {"ok": True, "route": _route_dict(row), "channel_id": row["channel_id"], "instance_id": row["instance_id"]}
+
+
+@registry_router.get("/resolve")
+def registry_resolve_get(
+    wx_account_id: Optional[str] = Query(default=None),
+    conversation_id: str = Query(...),
+    user: dict = Depends(need("viewer")),
+    platform: str = Query(default="wechat"),
+    account_id: Optional[str] = Query(default=None),
+) -> dict:
+    platform, account = _route_identity(platform, account_id, wx_account_id)
+    return _do_resolve_route(account, conversation_id, platform)
+
+
+@registry_router.post("/resolve")
+async def registry_resolve(
+    request: Request,
+    wx_account_id: Optional[str] = Query(default=None),
+    conversation_id: Optional[str] = Query(default=None),
+    user: dict = Depends(need("viewer")),
+    platform: Optional[str] = Query(default=None),
+    account_id: Optional[str] = Query(default=None),
+) -> dict:
+    """兼容 Query 参数与 JSON Body 两种调用方式。"""
+    wx = wx_account_id
+    conv = conversation_id
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            wx = wx or body.get("wx_account_id")
+            conv = conv or body.get("conversation_id")
+            account_id = account_id or body.get("account_id")
+            platform = platform or body.get("platform")
+    except Exception:
+        pass
+    platform, account = _route_identity(platform or "wechat", account_id, wx)
+    return _do_resolve_route(account, str(conv or ""), platform)
+
+
 @router.post("/login")
 def login(request: Request, body: LoginIn, response: Response) -> dict:
     username = body.username.strip()
+    client_ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "unknown")).split(",")[0].strip()
+    rate_key = f"{client_ip}:{username}"
     now = time.time()
-    fails = [t for t in _login_fails.get(username, []) if now - t < 300]
-    _login_fails[username] = fails
+
+    # 清理过期失败记录，防止字典无限膨胀
+    if len(_login_fails) > 200:
+        for k, ts_list in list(_login_fails.items()):
+            valid = [t for t in ts_list if now - t < 300]
+            if valid:
+                _login_fails[k] = valid
+            else:
+                _login_fails.pop(k, None)
+
+    fails = [t for t in _login_fails.get(rate_key, []) if now - t < 300]
+    _login_fails[rate_key] = fails
     if len(fails) >= 5:
         raise HTTPException(429, "尝试次数过多，请 5 分钟后再试")
 
     row = _q("SELECT * FROM console_users WHERE username = ?", (username,))
     if not row or not _verify_pw(body.password, row["password_hash"]):
         fails.append(now)
-        _login_fails[username] = fails
+        _login_fails[rate_key] = fails
         raise HTTPException(401, "用户名或密码错误")
 
-    _login_fails.pop(username, None)
+    _login_fails.pop(rate_key, None)
     _exec("UPDATE console_users SET last_login = ? WHERE id = ?", (now, row["id"]))
     _set_session_cookie(request, response, row["id"], row["token_version"])
     fresh = _q("SELECT * FROM console_users WHERE id = ?", (row["id"],))
@@ -854,10 +1329,15 @@ def overview(window: str = "24h", user: dict = Depends(current_user)) -> dict:
     for row in rows:
         idx = int((row["timestamp"] - since) / span * buckets)
         idx = min(max(idx, 0), buckets - 1)
-        key = "in" if row["direction"] == "inbound" else "out"
+        # 控制台消息虽然按 inbound 入库，但业务方向是控制台发给 Muse。
+        via = _meta(row["metadata"] if "metadata" in row.keys() else None).get("via")
+        key = "out" if via == "console" or row["direction"] == "outbound" else "in"
         series[idx][key] += 1
 
     online = len([a for a in agents if a["status"] in ("online", "active")])
+    total_inbound = sum(int(a.get("inbound", 0)) for a in agents)
+    total_outbound = sum(int(a.get("outbound", 0)) for a in agents)
+    total_messages = sum(int(a.get("total", 0)) for a in agents)
     return {
         "window": window,
         "since": since,
@@ -868,6 +1348,9 @@ def overview(window: str = "24h", user: dict = Depends(current_user)) -> dict:
             "messages": lineage["stats"]["messages"],
             "inbound": lineage["stats"]["inbound"],
             "outbound": lineage["stats"]["outbound"],
+            "total_messages": total_messages,
+            "total_inbound": total_inbound,
+            "total_outbound": total_outbound,
             "edges": lineage["stats"]["edges"],
             "inferred": lineage["stats"]["inferred"],
             "paired_ratio": lineage["stats"]["paired_ratio"],
@@ -886,20 +1369,13 @@ def list_agents(user: dict = Depends(current_user)) -> dict:
     visible = [a for a in everything if a["state"] == "visible"]
     hidden = [a for a in everything if a["state"] == "empty"]
     deleted = [a for a in everything if a["state"] == "deleted"]
-    return {
-        "agents": visible,
-        "count": len(visible),
-        # 自动忽略（收和发都没有信息）与已删除的信箱单独返回，界面上可以恢复
-        "hidden": hidden,
-        "deleted": deleted,
-    }
+    return {"agents": visible, "count": len(visible), "hidden": hidden, "deleted": deleted}
 
 
 @router.patch("/agents/{name}")
 def patch_agent(name: str, body: AgentPatch, user: dict = Depends(need("admin"))) -> dict:
     exists = _q("SELECT 1 FROM console_agents WHERE name = ?", (name,))
     if not exists:
-        # 人工新建的标注 = 人工认可它存在，pin 住，别被「空壳自动忽略」吃掉
         _exec("INSERT INTO console_agents (name, pinned) VALUES (?, 1)", (name,))
     fields, values = [], []
     for key in ("display_name", "role", "note", "color"):
@@ -910,43 +1386,28 @@ def patch_agent(name: str, body: AgentPatch, user: dict = Depends(need("admin"))
     if fields:
         values.append(name)
         _exec(f"UPDATE console_agents SET {', '.join(fields)} WHERE name = ?", tuple(values))
-    everything, _ann = _discover_agents()
-    return {"ok": True, "agent": next((a for a in everything if a["name"] == name), None)}
+    agents, _ann = _discover_agents()
+    return {"ok": True, "agent": next((a for a in agents if a["name"] == name), None)}
 
 
 @router.delete("/agents/{name}")
 def delete_agent(name: str, user: dict = Depends(need("admin"))) -> dict:
-    """手动删除信箱：只打一条删除水位线，消息与标注都保留。
-
-    删除后它从列表消失；等这个信箱再有通信（消息时间晚于水位线），
-    例如桥接又推来一条消息，它会自动重新出现。
-    """
     exists = _q("SELECT 1 FROM console_agents WHERE name = ?", (name,))
     if not exists:
         _exec("INSERT INTO console_agents (name) VALUES (?)", (name,))
-    _exec(
-        "UPDATE console_agents SET deleted_at = ?, pinned = 0 WHERE name = ?",
-        (time.time(), name),
-    )
+    _exec("UPDATE console_agents SET deleted_at = ?, pinned = 0 WHERE name = ?", (time.time(), name))
     return {"ok": True, "deleted": name, "until_next_message": True}
 
 
 @router.post("/agents/{name}/restore")
 def restore_agent(name: str, user: dict = Depends(need("admin"))) -> dict:
-    """恢复信箱：清掉删除水位线并 pin 住。
-
-    pin 是为了让「本来就没有消息」的空壳信箱恢复后也留得住，
-    否则会被自动忽略规则立刻再收走。
-    """
     exists = _q("SELECT 1 FROM console_agents WHERE name = ?", (name,))
     if not exists:
-        _exec("INSERT INTO console_agents (name) VALUES (?)", (name,))
-    _exec(
-        "UPDATE console_agents SET deleted_at = NULL, pinned = 1 WHERE name = ?",
-        (name,),
-    )
-    everything, _ann = _discover_agents()
-    return {"ok": True, "agent": next((a for a in everything if a["name"] == name), None)}
+        _exec("INSERT INTO console_agents (name, pinned) VALUES (?, 1)", (name,))
+    else:
+        _exec("UPDATE console_agents SET deleted_at = NULL, pinned = 1 WHERE name = ?", (name,))
+    agents, _ann = _discover_agents()
+    return {"ok": True, "agent": next((a for a in agents if a["name"] == name), None)}
 
 
 def _sniff_image(data: bytes) -> Optional[str]:
@@ -1060,10 +1521,18 @@ def messages(
     limit: int = Query(60, ge=1, le=200),
     before: Optional[float] = Query(None, description="取这个时间戳之前的历史"),
     after: Optional[float] = Query(None, description="增量拉取"),
+    direction: Optional[str] = Query(None, description="可选方向过滤 inbound/outbound"),
+    q: Optional[str] = Query(None, description="按内容关键词搜索"),
     user: dict = Depends(current_user),
 ) -> dict:
     sql = ["SELECT * FROM messages WHERE name = ?"]
     params: list[Any] = [name]
+    if direction in ("inbound", "outbound"):
+        sql.append("AND direction = ?")
+        params.append(direction)
+    if q and q.strip():
+        sql.append("AND content LIKE ?")
+        params.append(f"%{q.strip()}%")
     if before is not None:
         sql.append("AND timestamp < ?")
         params.append(before)
@@ -1094,35 +1563,60 @@ def messages(
 @router.post("/send")
 def send(body: SendIn, user: dict = Depends(need("operator"))) -> dict:
     content = (body.content or "").strip()
-    if not content:
-        raise HTTPException(400, "内容不能为空")
+    if not content and not body.media_url:
+        raise HTTPException(400, "内容或附件不能为空")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "缺少接收方信箱")
+    direction = (body.direction or "inbound").strip().lower()
+    if direction not in {"inbound", "outbound"}:
+        raise HTTPException(400, "direction 只能是 inbound 或 outbound")
+    msg_type = (body.type or "text").strip().lower()
+    if msg_type not in {"text", "image", "video", "audio", "file"}:
+        raise HTTPException(400, f"不支持的消息类型: {msg_type}")
     if body.media_url and not _safe_media_url(body.media_url):
         raise HTTPException(400, "media_url 只允许 http(s) 或本站 /uploads/ 路径")
 
     mid = str(uuid.uuid4())
     now = time.time()
-    # direction 用 inbound：这条是「人发给信箱的消息」，信箱侧的桥接/Agent 会当作
-    # 收到的消息处理。写成 outbound 会被误当成「该信箱要发出去的内容」——
-    # 实测会把控制台里发的话直接转发到微信群。
     _exec(
         """INSERT INTO messages (id, request_id, type, content, media_url, name,
                                  direction, timestamp, metadata)
-           VALUES (?, ?, ?, ?, ?, ?, 'inbound', ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             mid,
             body.request_id or mid[:8],
-            body.type or "text",
-            content,
+            msg_type,
+            content or None,
             body.media_url,
             name,
+            direction,
             now,
             json.dumps({"via": "console", "author": user["username"]}, ensure_ascii=False),
         ),
     )
+    notify_new_message()
     return {"ok": True, "id": mid, "timestamp": now}
+
+
+@router.delete("/messages/{message_id}")
+def delete_console_message(message_id: str, user: dict = Depends(need("operator"))) -> dict:
+    row = _q("SELECT media_url FROM messages WHERE id = ?", (message_id,))
+    if not row:
+        raise HTTPException(404, "消息不存在")
+    media_url = row["media_url"]
+    _exec("DELETE FROM messages WHERE id = ?", (message_id,))
+    if media_url and str(media_url).startswith("/uploads/"):
+        still_used = _q("SELECT 1 FROM messages WHERE media_url = ? LIMIT 1", (media_url,))
+        if not still_used:
+            try:
+                uploads_dir: Path = _STATE["uploads"]
+                path = (uploads_dir / Path(str(media_url)).name).resolve()
+                if path.is_relative_to(uploads_dir.resolve()):
+                    path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return {"ok": True}
 
 
 @router.post("/upload")
@@ -1258,7 +1752,7 @@ async def stream(
                     yield f"event: tick\ndata: {json.dumps({'ts': time.time(), 'cursor': cursor_ts})}\n\n"
                 else:
                     yield ": ping\n\n"
-            await asyncio.sleep(2)
+            await wait_for_message(2.0)
 
     return StreamingResponse(
         event_gen(),

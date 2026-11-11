@@ -10,6 +10,7 @@
 """
 
 import asyncio
+from contextlib import asynccontextmanager, closing
 import hmac
 import json
 import os
@@ -38,7 +39,7 @@ API_KEY = os.getenv("WEBHOOK_API_KEY", "").strip()
 ALLOW_NO_AUTH = os.getenv("WEBHOOK_ALLOW_NO_AUTH", "") == "1"
 POLL_INTERVAL = int(os.getenv("WEBHOOK_POLL_INTERVAL", "2"))
 MESSAGE_RETENTION_DAYS = int(os.getenv("WEBHOOK_MSG_RETENTION", "7"))
-MAX_UPLOAD_SIZE = int(os.getenv("WEBHOOK_MAX_UPLOAD_MB", "50")) * 1024 * 1024  # 默认 50MB
+MAX_UPLOAD_SIZE = int(os.getenv("WEBHOOK_MAX_UPLOAD_MB", "100")) * 1024 * 1024  # 默认 100MB
 CHAT_TIMEOUT = float(os.getenv("WEBHOOK_CHAT_TIMEOUT", "30"))
 MAX_CONTENT_CHARS = int(os.getenv("WEBHOOK_MAX_CONTENT_CHARS", "200000"))
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("WEBHOOK_CLEANUP_INTERVAL", "3600"))
@@ -69,27 +70,29 @@ def _get_db() -> sqlite3.Connection:
 
 
 def _init_db():
-    conn = _get_db()
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
-            request_id TEXT,
-            type TEXT NOT NULL,
-            content TEXT,
-            media_url TEXT,
-            name TEXT,
-            direction TEXT NOT NULL DEFAULT 'inbound',
-            timestamp REAL NOT NULL,
-            metadata TEXT
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_name ON messages(name)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_request_id ON messages(request_id)")
-    conn.commit()
-    conn.close()
+    with closing(_get_db()) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                request_id TEXT,
+                type TEXT NOT NULL,
+                content TEXT,
+                media_url TEXT,
+                name TEXT,
+                direction TEXT NOT NULL DEFAULT 'inbound',
+                timestamp REAL NOT NULL,
+                metadata TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_name ON messages(name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_request_id ON messages(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_name_ts ON messages(name, timestamp DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts_id ON messages(timestamp, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_name_dir_ts ON messages(name, direction, timestamp DESC)")
+        conn.commit()
 
 
 _init_db()
@@ -150,17 +153,20 @@ class ChatCompletionResponse(BaseModel):
 def _save_message(msg: Message) -> str:
     mid = msg.id or str(uuid.uuid4())
     msg.id = mid
-    conn = _get_db()
-    conn.execute(
-        """INSERT OR REPLACE INTO messages
-           (id, request_id, type, content, media_url, name, direction, timestamp, metadata)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (mid, msg.request_id, msg.type, msg.content, msg.media_url,
-         msg.name, msg.direction, msg.timestamp,
-         json.dumps(msg.metadata, ensure_ascii=False) if msg.metadata else None)
-    )
-    conn.commit()
-    conn.close()
+    with closing(_get_db()) as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO messages
+               (id, request_id, type, content, media_url, name, direction, timestamp, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (mid, msg.request_id, msg.type, msg.content, msg.media_url,
+             msg.name, msg.direction, msg.timestamp,
+             json.dumps(msg.metadata, ensure_ascii=False) if msg.metadata else None)
+        )
+        conn.commit()
+    try:
+        console_api.notify_new_message()
+    except Exception:
+        pass
     return mid
 
 
@@ -237,7 +243,7 @@ def _find_duplicate_message(msg: Message, window: float) -> Optional[Message]:
 
 
 def _remove_upload(rel_url: Optional[str]):
-    """删除重传产生的孤儿文件（仅限 UPLOADS_DIR 内）。"""
+    """删除重传或过期产生的孤儿文件（仅限 UPLOADS_DIR 内）。"""
     if not rel_url or not rel_url.startswith("/uploads/"):
         return
     try:
@@ -248,12 +254,25 @@ def _remove_upload(rel_url: Optional[str]):
         pass
 
 
+def _remove_upload_if_unreferenced(rel_url: Optional[str]):
+    """仅当没有任何消息引用该 media_url 时删除对应上传文件。"""
+    if not rel_url or not rel_url.startswith("/uploads/"):
+        return
+    with closing(_get_db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM messages WHERE media_url = ? LIMIT 1",
+            (rel_url,),
+        ).fetchone()
+    if not row:
+        _remove_upload(rel_url)
+
+
 def _save_with_idempotency(msg: Message) -> tuple[Message, str, bool]:
     """保存消息（带幂等）。返回 (实际生效的消息, message_id, 是否为重复)。"""
     dup = _find_duplicate_message(msg, IDEMPOTENCY_WINDOW)
     if dup:
         if msg.media_url and msg.media_url != dup.media_url:
-            _remove_upload(msg.media_url)
+            _remove_upload_if_unreferenced(msg.media_url)
         return dup, dup.id, True
     return msg, _save_message(msg), False
 
@@ -264,7 +283,6 @@ def _list_messages(name: Optional[str] = None, limit: int = 50,
                    after: Optional[float] = None,
                    request_id: Optional[str] = None,
                    ascending: bool = False) -> list[Message]:
-    conn = _get_db()
     conditions = []
     params = []
 
@@ -286,11 +304,11 @@ def _list_messages(name: Optional[str] = None, limit: int = 50,
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     order = "ASC" if ascending else "DESC"
-    rows = conn.execute(
-        f"SELECT * FROM messages {where} ORDER BY timestamp {order} LIMIT ?",
-        [*params, limit]
-    ).fetchall()
-    conn.close()
+    with closing(_get_db()) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM messages {where} ORDER BY timestamp {order}, id {order} LIMIT ?",
+            [*params, limit]
+        ).fetchall()
 
     results = []
     for row in rows:
@@ -310,11 +328,17 @@ def _list_messages(name: Optional[str] = None, limit: int = 50,
 
 def _clean_old_messages() -> int:
     cutoff = time.time() - MESSAGE_RETENTION_DAYS * 86400
-    conn = _get_db()
-    cursor = conn.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
-    deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
+    with closing(_get_db()) as conn:
+        media_rows = conn.execute(
+            "SELECT DISTINCT media_url FROM messages WHERE timestamp < ? AND media_url LIKE '/uploads/%'",
+            (cutoff,),
+        ).fetchall()
+        old_media = [r["media_url"] for r in media_rows if r["media_url"]]
+        cursor = conn.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
+        deleted = cursor.rowcount
+        conn.commit()
+    for rel_url in old_media:
+        _remove_upload_if_unreferenced(rel_url)
     return deleted
 
 
@@ -456,12 +480,40 @@ def _stream_file(path: Path, content_type: str):
     )
 
 
-# ─── FastAPI 应用 ───────────────────────────────────────────────────────────
+# ─── FastAPI 应用与生命周期 ──────────────────────────────────────────────────
+
+async def _periodic_cleanup_loop():
+    interval = max(CLEANUP_INTERVAL_SECONDS, 60)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            _clean_old_messages()
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    try:
+        _clean_old_messages()
+    except Exception:
+        pass
+    cleanup_task = asyncio.create_task(_periodic_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
 
 app = FastAPI(
     title="Webhook API",
-    description="消息收发中间件 — SQLite 存储、OpenAI 兼容接口、SSE 推流",
-    version="1.2.0",
+    description="消息收发中间件 — SQLite 存储、OpenAI 兼容接口、SSE 推流、Muse 注册中心",
+    version="1.3.0",
+    lifespan=_lifespan,
 )
 
 # ─── 工作台：账号权限 / 信箱检测 / 链路推断 / 实时推送 ──────────────────────
@@ -473,9 +525,20 @@ except ImportError:  # 直接以脚本方式运行时
 
 console_api.configure(STORAGE_DIR, API_KEY, ALLOW_NO_AUTH)
 app.include_router(console_api.router)
+app.include_router(console_api.registry_router)
 
 
 # ─── 静态页面：中继台 ───────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def _no_cache_viz_static(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/viz"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 
 VIZ_DIR = BASE_DIR / "static" / "viz"
 if VIZ_DIR.is_dir():
@@ -569,35 +632,66 @@ async def outbound(
 
 @app.get("/stream/{name}")
 async def stream(
+    request: Request,
     name: str = FastAPIPath(..., description="订阅名称"),
+    since: Optional[float] = Query(default=None, description="起始时间戳（可选）"),
+    direction: Optional[str] = Query(default=None, description="可选方向过滤 inbound/outbound"),
     authorization: Optional[str] = Header(None),
 ):
-    """SSE 实时推流：当有新消息时推送，替代轮询"""
+    """SSE 实时推流：当有新消息时立即推送，替代轮询"""
     _check_auth(authorization)
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        conn = _get_db()
-        try:
+        with closing(_get_db()) as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(timestamp), 0) FROM messages WHERE name = ?",
                 (name,)
             ).fetchone()
-            last_ts = max(time.time(), row[0])
-        finally:
-            conn.close()
+            cursor_ts = since if since is not None else max(time.time(), float(row[0] or 0))
+            cursor_id = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
 
         while True:
-            # 每批最多取 200 条，游标推进到“本批最后实际推送的那条”，
-            # 积压超过 200 条时下一轮继续取，不丢消息。
-            msgs = _list_messages(name=name, after=last_ts, limit=200, ascending=True)
-            if not msgs:
+            if await request.is_disconnected():
+                break
+
+            with closing(_get_db()) as conn:
+                if direction:
+                    rows = conn.execute(
+                        """SELECT * FROM messages
+                           WHERE name = ? AND direction = ?
+                             AND (timestamp > ? OR (timestamp = ? AND id > ?))
+                           ORDER BY timestamp ASC, id ASC LIMIT 200""",
+                        (name, direction, cursor_ts, cursor_ts, cursor_id),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT * FROM messages
+                           WHERE name = ?
+                             AND (timestamp > ? OR (timestamp = ? AND id > ?))
+                           ORDER BY timestamp ASC, id ASC LIMIT 200""",
+                        (name, cursor_ts, cursor_ts, cursor_id),
+                    ).fetchall()
+
+            if not rows:
                 yield ": ping\n\n"
-                await asyncio.sleep(POLL_INTERVAL)
+                await console_api.wait_for_message(POLL_INTERVAL)
                 continue
 
-            for m in msgs:
+            for r in rows:
+                cursor_ts = r["timestamp"]
+                cursor_id = r["id"]
+                m = Message(
+                    id=r["id"],
+                    request_id=r["request_id"],
+                    type=r["type"],
+                    content=r["content"],
+                    media_url=r["media_url"],
+                    name=r["name"],
+                    direction=r["direction"],
+                    timestamp=r["timestamp"],
+                    metadata=json.loads(r["metadata"]) if r["metadata"] else {},
+                )
                 yield f"data: {json.dumps(m.model_dump(), ensure_ascii=False)}\n\n"
-            last_ts = msgs[-1].timestamp
 
     return StreamingResponse(
         event_stream(),
@@ -613,14 +707,11 @@ async def signal(
     name: str = FastAPIPath(..., description="消息名称/发送方标识"),
 ):
     """公开信号接口：返回指定 name 的消息总数和最新时间戳"""
-    conn = _get_db()
-    try:
+    with closing(_get_db()) as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS count, COALESCE(MAX(timestamp), 0) AS latest FROM messages WHERE name = ?",
             (name,),
         ).fetchone()
-    finally:
-        conn.close()
     return {"name": name, "count": row["count"], "latest_timestamp": row["latest"]}
 
 
@@ -657,27 +748,37 @@ async def chat_completions(
     )
     _save_message(msg)
 
-    # 只等待本次请求之后、同 request_id 的 outbound 回复
+    # 等待本次请求之后、同 request_id 的 outbound 回复（支持事件即时唤醒）
     reply = None
     deadline = started + CHAT_TIMEOUT
     while time.time() < deadline:
-        await asyncio.sleep(0.25)
         replies = _list_messages(
             name=body.name,
             direction="outbound",
             request_id=request_id,
-            since=started,
+            since=started - 0.001,
             limit=1,
             ascending=True,
         )
         if replies:
             reply = replies[0]
             break
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        await console_api.wait_for_message(min(0.25, remaining))
 
     if reply is None:
         raise HTTPException(504, "No reply from agent before timeout")
 
-    final_content = reply.content or str(reply.model_dump())
+    if reply.content and reply.media_url:
+        final_content = f"{reply.content}\n{reply.media_url}"
+    elif reply.content:
+        final_content = reply.content
+    elif reply.media_url:
+        final_content = f"[{reply.type}] {reply.media_url}"
+    else:
+        final_content = str(reply.model_dump())
 
     return ChatCompletionResponse(
         id=str(uuid.uuid4()),
@@ -730,13 +831,15 @@ async def delete_message(
     authorization: Optional[str] = Header(None),
 ):
     _check_auth(authorization)
-    conn = _get_db()
-    cursor = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
-    conn.commit()
-    deleted = cursor.rowcount
-    conn.close()
+    with closing(_get_db()) as conn:
+        row = conn.execute("SELECT media_url FROM messages WHERE id = ?", (message_id,)).fetchone()
+        cursor = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        conn.commit()
+        deleted = cursor.rowcount
     if deleted == 0:
         raise HTTPException(404, "Message not found")
+    if row and row["media_url"]:
+        _remove_upload_if_unreferenced(row["media_url"])
     return {"status": "ok"}
 
 
@@ -747,13 +850,6 @@ async def cleanup(
     _check_auth(authorization)
     deleted = _clean_old_messages()
     return {"status": "ok", "cleaned": deleted}
-
-
-# ─── 定时清理（启动时）──────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup():
-    _clean_old_messages()
 
 
 # ─── 启动入口 ───────────────────────────────────────────────────────────────
