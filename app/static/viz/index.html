@@ -3,40 +3,58 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#f5f5f4">
-  <title>Webhook 工作台</title>
+  <meta name="theme-color" content="#07090e">
+  <title>MUSE OPS · 中继战术工作台</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="assets/app.css">
-  <link rel="stylesheet" href="assets/theme.css?v=20261110-v1">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;800;900&family=JetBrains+Mono:wght@400;500;600;700;800&family=Michroma&family=Noto+Sans+SC:wght@400;500;600;700;900&family=Syncopate:wght@700&display=swap">
+  <link rel="stylesheet" href="assets/app.css?v=20261110-v5">
 </head>
 <body>
   <div id="boot" class="boot">
     <div class="spin"></div>
-    <p>正在连接中继服务…</p>
+    <p>正在连接中继核心…</p>
   </div>
 
   <div id="app" hidden>
     <aside id="sidebar">
       <div class="brand">
-        <b id="brandName">Webhook</b>
-        <span>Relay Workbench</span>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="12 2 21 7 21 17 12 22 3 17 3 7"/>
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 2v7M21 7l-6 3.5M21 17l-6-3.5M12 22v-7M3 17l6-3.5M3 7l6 3.5"/>
+          </svg>
+        </div>
+        <div class="brand-txt">
+          <b id="brandName">MUSE OPS</b>
+          <span>中继协同控制台 v2.2</span>
+        </div>
       </div>
       <nav class="nav" id="nav"></nav>
+      <div class="side-clock">
+        <span class="sc-label">系统实时时钟</span>
+        <b id="sysClock">--:--:--</b>
+      </div>
       <div class="side-user" id="sideUser"></div>
     </aside>
 
     <div class="workspace">
       <header class="topbar">
         <button class="iconbtn menubtn" id="menuBtn" aria-label="菜单"></button>
-        <h1 id="pageTitle">总览</h1>
-        <span class="sub" id="pageSub"></span>
-        <span class="spacer"></span>
-        <div class="theme-switch" id="themeSwitch" title="切换主题">
-          <button type="button" data-theme-opt="cyber" class="on">赛博</button>
-          <button type="button" data-theme-opt="amber">黑金</button>
-          <button type="button" data-theme-opt="ops">工程</button>
+        <div class="topbar-titles">
+          <span class="topbar-tag" id="pageTag">总览看板</span>
+          <h1 id="pageTitle">总览与链路态势</h1>
+          <span class="sub" id="pageSub"></span>
         </div>
-        <span class="live" id="liveState"></span>
+        <span class="spacer"></span>
+        <div class="theme-switch" id="themeSwitch" title="快捷键 T 切换主题">
+          <button type="button" data-theme-opt="cyber" class="on">赛博深色</button>
+          <button type="button" data-theme-opt="amber">黑金总部</button>
+          <button type="button" data-theme-opt="ops">纸面工程</button>
+        </div>
+        <span class="live-pill" id="liveState"></span>
       </header>
       <main id="view"></main>
     </div>
@@ -45,6 +63,6 @@
   <div id="toast" class="toast-wrap"></div>
   <div id="modal" class="modal-wrap" hidden></div>
 
-  <script type="module" src="assets/app.js"></script>
+  <script type="module" src="assets/app.js?v=20261111-platforms"></script>
 </body>
 </html>

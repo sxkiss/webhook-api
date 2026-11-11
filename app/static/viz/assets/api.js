@@ -65,11 +65,23 @@ export const api = {
   events: (limit) => request(`/api/console/events${qs({ limit })}`),
   messages: (name, params) => request(`/api/console/messages${qs({ name, ...params })}`),
   send: (payload) => request('/api/console/send', { method: 'POST', body: payload }),
+  deleteMessage: (id) => request(`/api/console/messages/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   upload: (file) => {
     const form = new FormData();
     form.append('file', file);
     return request('/api/console/upload', { method: 'POST', form });
   },
+
+  muses: () => request('/api/registry/muses'),
+  registerMuse: (body) => request('/api/registry/muse/register', { method: 'POST', body }),
+  patchMuse: (instanceId, body) => request(`/api/registry/muse/${encodeURIComponent(instanceId)}`, { method: 'PATCH', body }),
+  deleteMuse: (instanceId) => request(`/api/registry/muse/${encodeURIComponent(instanceId)}`, { method: 'DELETE' }),
+  routes: (wxAccountId, platform) => request(`/api/registry/routes${qs({ wx_account_id: wxAccountId, platform })}`),
+  bindRoute: (body) => request('/api/registry/routes/bind', { method: 'POST', body }),
+  patchRoute: (routeId, body) => request(`/api/registry/routes/${encodeURIComponent(routeId)}`, { method: 'PATCH', body }),
+  deleteRoute: (routeId) => request(`/api/registry/routes/${encodeURIComponent(routeId)}`, { method: 'DELETE' }),
+  resolveRoute: (accountId, conversationId, platform = 'wechat') =>
+    request('/api/registry/resolve', { method: 'POST', body: { platform, account_id: accountId, conversation_id: conversationId } }),
 
   settings: () => request('/api/console/settings'),
   saveSettings: (patch) => request('/api/console/settings', { method: 'PUT', body: patch }),

@@ -1,10 +1,13 @@
 import { api, store } from '../api.js';
-import { esc, icon, initial, defaultAvatar, statusText, rel, toast, modal, debounce } from '../ui.js';
+import {
+  esc, num, icon, initial, defaultAvatar, statusText, rel, toast, modal,
+  paletteFor, museBadgeText, resolveMuseLiveAction, openMuseActionModal,
+} from '../ui.js';
 
 let filter = '';
 let agentsRef = [];
-let hiddenRef = [];    // 收和发都没有信息，被自动忽略的
-let deletedRef = [];   // 手动删除、等下次通信的
+let hiddenRef = [];
+let deletedRef = [];
 
 const T = {
   fileInput: null,
@@ -21,18 +24,18 @@ export async function mount(root, ctx) {
   root.innerHTML = `
     <div class="pg-agents">
       <div class="panel-head" style="padding:0 0 12px;border:0;background:transparent">
-        <h2 style="font-size:14px">自动检测到的信箱</h2>
-        <span class="chip" id="cnt">—</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="dp-badge">UNITS & ACTIONS</span>
+          <h2 style="font-size:15px">信箱成员 · 工位数量与动作定义</h2>
+          <span class="chip" id="cnt">—</span>
+        </div>
         <span class="spacer"></span>
-        <input type="search" id="search" placeholder="搜索信箱…" style="width:170px" autocomplete="off">
-        ${canEdit ? `<button class="btn ghost sm" id="addBtn">${icon('plus', 13)}新增标注</button>` : ''}
-        <button class="btn ghost sm" id="refreshBtn">${icon('refresh', 13)}刷新</button>
+        <input type="search" id="search" placeholder="搜索信箱、职能或去向…" style="width:210px" autocomplete="off">
+        ${canEdit ? `<button class="btn ghost sm" id="addBtn">${icon('plus', 13)} 新增标注</button>` : ''}
+        <button class="btn ghost sm" id="refreshBtn">${icon('refresh', 13)} 刷新</button>
       </div>
-      <p class="muted" style="font-size:12px;margin:0 0 12px;line-height:1.7">
-        信箱不靠手工登记：只要 <code>messages</code> 表里出现过名字，就会在这里自动出现。
-        形象、显示名与角色属于「标注」，存在独立的 <code>console_agents</code> 表里，不影响消息数据。
-        删掉的信箱只记一条水位线，历史消息和标注都还在，等它下次再有通信会自动回来。
-        ${canUpload ? '' : '当前角色只读，无法上传形象。'}
+      <p class="muted" style="font-size:12px;margin:0 0 14px;line-height:1.65">
+        实时汇总每个 Muse 工位的<b>收发报文数量</b>、<b>数据去向路由</b>以及<b>3D 工位实时动作定义（入站 / 推演 / 出站 / 协同 / 待命）</b>。点击卡片上的「⚡ 动作定义」可自定义每个 Muse 的行为规范与 3D 姿态。
       </p>
       <div class="grid-agents" id="grid"></div>
       <div id="tucked"></div>
@@ -76,14 +79,38 @@ export async function mount(root, ctx) {
 
 async function load(grid, root, ctx) {
   try {
-    const data = await api.agents();
-    agentsRef = data.agents || [];
+    const [data, lineage, routesData] = await Promise.all([
+      api.agents(),
+      api.lineage('24h', true).catch(() => ({ nodes: [] })),
+      api.routes().catch(() => ({ routes: [] })),
+    ]);
+    const lnMap = new Map((lineage.nodes || []).map((n) => [n.name, n]));
+    const routeMap = new Map();
+    for (const r of (routesData.routes || [])) {
+      const ch = r.channel_id || r.inbox_name;
+      const enabled = (r.enabled !== undefined ? Boolean(r.enabled) : r.status === 'active') && r.muse_status !== 'disabled';
+      if (enabled && ch) {
+        const arr = routeMap.get(ch) || [];
+        arr.push(r);
+        routeMap.set(ch, arr);
+      }
+    }
+
+    agentsRef = (data.agents || []).map((a) => {
+      const ln = lnMap.get(a.name);
+      return {
+        ...a,
+        peers_out: ln?.peers_out || [],
+        peers_in: ln?.peers_in || [],
+        routes: routeMap.get(a.name) || [],
+      };
+    });
     hiddenRef = data.hidden || [];
     deletedRef = data.deleted || [];
     store.setAgents(agentsRef);
+    const totalMsgs = agentsRef.reduce((acc, a) => acc + (a.total || 0), 0);
     const tucked = hiddenRef.length + deletedRef.length;
-    root.querySelector('#cnt').textContent =
-      `${agentsRef.length} 个信箱${tucked ? ` · 隐藏 ${tucked}` : ''}`;
+    root.querySelector('#cnt').textContent = `${agentsRef.length} 个工位 · 累计 ${num(totalMsgs)} 条报文${tucked ? ` · 隐藏 ${tucked}` : ''}`;
     renderGrid(grid, root, ctx);
   } catch (err) {
     grid.innerHTML = `<div class="empty-state"><b>加载失败</b><span>${esc(err.message)}</span></div>`;
@@ -93,12 +120,20 @@ async function load(grid, root, ctx) {
 function renderGrid(grid, root, ctx) {
   const canEdit = ctx.user?.role === 'admin';
   const canUpload = ['admin', 'operator'].includes(ctx.user?.role);
+  const customMap = store.settings?.muse_actions || {};
+  const nowSec = Date.now() / 1000;
   renderTucked(root, ctx);
+
   let list = agentsRef;
-  if (filter) list = list.filter((a) => `${a.name} ${a.display_name}`.toLowerCase().includes(filter));
+  if (filter) {
+    list = list.filter((a) => {
+      const liveAct = resolveMuseLiveAction(a, customMap, null, nowSec);
+      return `${a.name} ${a.display_name} ${a.role || ''} ${liveAct.profile.duty} ${liveAct.actionText}`.toLowerCase().includes(filter);
+    });
+  }
 
   if (!list.length) {
-    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><b>还没有信箱</b>
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><b>还没有匹配的信箱</b>
       <span>任意 agent 往 /webhook/inbound/{name} 推一条消息，这里就会自动出现</span></div>`;
     return;
   }
@@ -106,34 +141,66 @@ function renderGrid(grid, root, ctx) {
   grid.innerHTML = list.map((a) => {
     const av = a.avatar || defaultAvatar(a.name);
     const label = a.display_name || a.name;
-    return `<div class="agent-card" data-name="${esc(a.name)}">
+    const pal = paletteFor(a.name);
+    const badge = museBadgeText(a.name);
+    const fbStyle = `background:${pal.bg};color:${pal.fg};border-color:${pal.border}`;
+    const liveAct = resolveMuseLiveAction(a, customMap, null, nowSec);
+    const prof = liveAct.profile;
+
+    const outs = (a.peers_out || []).slice(0, 2).map((p) => {
+      const dst = p.to === 'relay' ? '中继核心' : p.to;
+      return `<span class="ag-dest out">→ ${esc(dst)} <b>(${p.count}条)</b></span>`;
+    });
+    const ins = (a.peers_in || []).slice(0, 1).map((p) => {
+      const src = p.from === 'relay' ? '中继核心' : p.from;
+      return `<span class="ag-dest in">← ${esc(src)} <b>(${p.count}条)</b></span>`;
+    });
+    const destHtml = [...outs, ...ins].join(' ') || ((a.total || 0) > 0
+      ? `<span class="ag-dest muted">⇄ 中继核心 (${a.total}条)</span>`
+      : '<span class="ag-dest muted">暂无活跃流向</span>');
+
+    return `<div class="agent-card" data-name="${esc(a.name)}" style="--act-c:${liveAct.meta.color}">
       <div class="av-wrap">
         ${av
           ? `<img class="av-lg" src="${esc(av)}" alt="${esc(label)}"
                onerror="this.style.display='none';this.nextElementSibling.style.display='grid'">
-             <div class="av-fallback" style="display:none">${esc(initial(label))}</div>`
-          : `<div class="av-fallback">${esc(initial(label))}</div>`}
+             <div class="av-fallback" style="display:none;${fbStyle}">${esc(initial(label))}</div>`
+          : `<div class="av-fallback" style="${fbStyle}">${esc(initial(label))}</div>`}
+        ${badge ? `<span class="av-muse-badge">${esc(badge)}</span>` : ''}
         ${canUpload ? `<button class="av-edit" data-act="upload" title="上传形象">${icon('camera', 11)}</button>` : ''}
       </div>
       <div class="info">
-        <div class="nm">${esc(label)}
-          ${a.role ? `<span class="chip" style="font-size:10px;padding:0 6px">${esc(a.role)}</span>` : ''}
+        <div class="nm">
+          <b>${esc(label)}</b>
+          <span class="ag-act-pill" style="color:${liveAct.meta.color};border-color:${liveAct.meta.color}">
+            ${liveAct.meta.icon} ${esc(liveAct.meta.short)}
+          </span>
+          ${a.routes?.length ? `<span class="chip in" style="font-size:10px;padding:0 6px">${a.routes.length} 路由</span>` : ''}
         </div>
-        <div class="raw">${esc(a.name)}</div>
-        <div class="stats">
-          <span>收 <b>${a.inbound}</b></span>
-          <span>发 <b>${a.outbound}</b></span>
-          <span>共 <b>${a.total}</b></span>
+        <div class="raw">标识: <code>${esc(a.name)}</code> · <span class="dot ${esc(a.status)}"></span> ${statusText(a.status)} (${rel(a.last_ts)})</div>
+        <div class="ag-duty">${esc(prof.duty)}</div>
+        <div class="ag-live-now">
+          <span class="lbl">正在干嘛:</span>
+          <span class="val">${esc(liveAct.actionText)}</span>
         </div>
-        <div class="stats" style="margin-top:4px;color:var(--ink3)">
-          <span class="dot ${esc(a.status)}"></span>
-          <span>${statusText(a.status)} · ${rel(a.last_ts)}</span>
+        <div class="stats" style="margin-top:6px">
+          <span>↓收进 <b class="in-val">${num(a.inbound)}</b></span>
+          <span>↑发出 <b class="out-val">${num(a.outbound)}</b></span>
+          <span>Σ总计 <b>${num(a.total)} 条</b></span>
+        </div>
+        <div class="ag-dest-row">
+          <span class="lbl">数据去向:</span>
+          ${destHtml}
         </div>
       </div>
-      <div class="agent-actions">
-        <button class="iconbtn" data-act="chat" title="打开通信台">${icon('chat', 13)}</button>
-        ${canEdit ? `<button class="iconbtn" data-act="edit" title="编辑资料">${icon('settings', 13)}</button>` : ''}
-        ${canEdit ? `<button class="iconbtn" data-act="del" title="删除信箱">${icon('x', 13)}</button>` : ''}
+      <div class="agent-actions" style="flex-direction:column;gap:5px">
+        <button class="btn ghost sm" data-act="action-def" title="定义该 Muse 的 3D 工位动作">⚡ 动作定义</button>
+        <div style="display:flex;gap:5px;justify-content:flex-end">
+          <button class="iconbtn" data-act="office" title="在 3D 指挥室查看">${icon('office', 13)}</button>
+          <button class="iconbtn" data-act="chat" title="打开通信台">${icon('chat', 13)}</button>
+          ${canEdit ? `<button class="iconbtn" data-act="edit" title="编辑资料">${icon('settings', 13)}</button>` : ''}
+          ${canEdit ? `<button class="iconbtn" data-act="del" title="隐藏信箱">${icon('x', 13)}</button>` : ''}
+        </div>
       </div>
     </div>`;
   }).join('');
@@ -150,6 +217,10 @@ function renderGrid(grid, root, ctx) {
           T.fileInput.click();
         } else if (act === 'chat') {
           ctx.go('chat', { agent: name });
+        } else if (act === 'office') {
+          ctx.go('office');
+        } else if (act === 'action-def') {
+          openMuseActionModal(agent, store, api, () => renderGrid(grid, root, ctx));
         } else if (act === 'edit') {
           editAgent(agent);
         } else if (act === 'del') {
@@ -157,6 +228,62 @@ function renderGrid(grid, root, ctx) {
         }
       };
     });
+  });
+}
+
+function confirmDelete(agent) {
+  const label = agent.display_name || agent.name;
+  modal({
+    title: `隐藏「${label}」`,
+    okText: '隐藏',
+    body: '<p style="margin:0;font-size:12.5px;line-height:1.7">只隐藏信箱，不删除历史消息或标注。下次有新通信后会自动恢复，也可以在下方手动恢复。</p>',
+    onOk: async () => {
+      try {
+        await api.deleteAgent(agent.name);
+        toast(`已隐藏「${label}」`);
+        T.reload();
+        return true;
+      } catch (err) {
+        toast(err.message, 'err');
+        return false;
+      }
+    },
+  });
+}
+
+async function restoreAgent(name, label) {
+  try {
+    await api.restoreAgent(name);
+    toast(`已恢复「${label || name}」`);
+    T.reload();
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+function renderTucked(root, ctx) {
+  const host = root.querySelector('#tucked');
+  if (!host) return;
+  const canEdit = ctx.user?.role === 'admin';
+  const groups = [
+    ['deleted', '已隐藏，等下次通信', deletedRef],
+    ['hidden', '自动忽略（没有消息）', hiddenRef],
+  ].filter(([, , list]) => list.length);
+  if (!groups.length) { host.innerHTML = ''; return; }
+  host.innerHTML = groups.map(([key, title, list]) => `
+    <div style="margin-top:18px">
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px">
+        <b style="font-size:12.5px">${esc(title)}</b><span class="chip" style="font-size:10px">${list.length}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">
+        ${list.map((a) => `<span class="chip" style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px">
+          ${esc(a.display_name || a.name)}
+          ${canEdit ? `<button class="iconbtn" data-restore="${esc(a.name)}" data-label="${esc(a.display_name || a.name)}" title="恢复">↻</button>` : ''}
+        </span>`).join('')}
+      </div>
+    </div>`).join('');
+  host.querySelectorAll('[data-restore]').forEach((btn) => {
+    btn.onclick = () => restoreAgent(btn.dataset.restore, btn.dataset.label);
   });
 }
 
@@ -209,87 +336,6 @@ function editAgent(agent) {
   }
 }
 
-function confirmDelete(agent) {
-  const label = agent.display_name || agent.name;
-  modal({
-    title: `删除信箱「${label}」`,
-    okText: '删除',
-    body: `<p style="margin:0 0 10px;font-size:12.5px;color:var(--ink2);line-height:1.7">
-        只是把它从列表里藏起来，<b>历史消息和标注都不会删</b>。</p>
-      <p style="margin:0;font-size:12.5px;color:var(--ink2);line-height:1.7">
-        等这个信箱下次再有通信（新的消息时间晚于现在），它会自动重新出现。
-        删除后在下方「已删除」里也能随时手动恢复。</p>`,
-    onOk: async () => {
-      try {
-        await api.deleteAgent(agent.name);
-        toast(`已隐藏「${label}」，有新通信会自动回来`);
-        T.reload();
-        return true;
-      } catch (err) {
-        toast(err.message, 'err');
-        return false;
-      }
-    },
-  });
-}
-
-async function restoreAgent(name, label) {
-  try {
-    await api.restoreAgent(name);
-    toast(`已恢复「${label || name}」`);
-    T.reload();
-  } catch (err) {
-    toast(err.message, 'err');
-  }
-}
-
-// 「已删除」「自动忽略」两栏：折叠式，不抢主列表的位置
-function renderTucked(root, ctx) {
-  const host = root.querySelector('#tucked');
-  if (!host) return;
-  const canEdit = ctx.user?.role === 'admin';
-  const groups = [
-    {
-      key: 'deleted',
-      title: '已删除，等下次通信',
-      hint: '有新消息进来会自动回到列表；也可以现在恢复',
-      list: deletedRef,
-    },
-    {
-      key: 'hidden',
-      title: '自动忽略（收和发都没有消息）',
-      hint: '只是注册了标注、从没有过消息的空壳;人工固定过的不在此列',
-      list: hiddenRef,
-    },
-  ].filter((g) => g.list.length);
-
-  if (!groups.length) {
-    host.innerHTML = '';
-    return;
-  }
-
-  host.innerHTML = groups.map((g) => `
-    <div style="margin-top:18px">
-      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px">
-        <b style="font-size:12.5px">${esc(g.title)}</b>
-        <span class="chip" style="font-size:10px">${g.list.length}</span>
-        <span class="muted" style="font-size:11.5px">${esc(g.hint)}</span>
-      </div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px">
-        ${g.list.map((a) => `<span class="chip" data-g="${g.key}" data-name="${esc(a.name)}"
-            style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;opacity:.85">
-            ${esc(a.display_name || a.name)}
-            ${canEdit ? `<button class="iconbtn" data-restore="${esc(a.name)}"
-                data-label="${esc(a.display_name || a.name)}" title="恢复">${icon('refresh', 11)}</button>` : ''}
-          </span>`).join('')}
-      </div>
-    </div>`).join('');
-
-  host.querySelectorAll('[data-restore]').forEach((btn) => {
-    btn.onclick = () => restoreAgent(btn.dataset.restore, btn.dataset.label);
-  });
-}
-
 function addAgent(ctx) {
   modal({
     title: '新增信箱标注',
@@ -302,7 +348,7 @@ function addAgent(ctx) {
       if (!name) { toast('请填写信箱名', 'err'); return false; }
       try {
         await api.patchAgent(name, { display_name: '' });
-        toast('已创建，没有消息也会先显示');
+        toast('已创建，可以上传形象了');
         T.reload();
         return true;
       } catch (err) {

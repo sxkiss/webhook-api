@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import { esc } from '../ui.js';
 
-export async function mount(root) {
+export async function mount(root, ctx) {
   root.innerHTML = `
     <div class="pg-login">
       <form class="login-card" id="loginForm">
@@ -33,8 +33,12 @@ export async function mount(root) {
     btn.textContent = '登录中…';
     try {
       await api.login(root.querySelector('#username').value.trim(), root.querySelector('#password').value);
-      location.hash = '#/overview';
-      location.reload();
+      if (ctx?.onLoginSuccess) {
+        await ctx.onLoginSuccess();
+      } else {
+        location.hash = '#/overview';
+        location.reload();
+      }
     } catch (err) {
       errBox.hidden = false;
       errBox.textContent = err.message || '登录失败';
