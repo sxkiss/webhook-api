@@ -1,11 +1,11 @@
 import { api, store, startStream, stopStream, onUnauthorized, ApiError } from './api.js';
 import { icon, esc, initial, toast, modal } from './ui.js';
 import * as loginPage from './pages/login.js?v=20261110-v5';
-import * as overviewPage from './pages/overview.js?v=20261110-v5';
+import * as overviewPage from './pages/overview.js?v=20261111-v9';
 import * as chatPage from './pages/chat.js?v=20261111-platforms';
 import * as officePage from './pages/office.js?v=20261111-platforms';
 import * as tacticalPage from './pages/tactical.js?v=20261110-v1';
-import * as workstationsPage from './pages/workstations.js?v=20261110-v5';
+import * as workstationsPage from './pages/workstations.js?v=20261111-v9';
 import * as agentsPage from './pages/agents.js?v=20261110-v5';
 import * as registryPage from './pages/registry.js?v=20261111-platforms';
 import * as settingsPage from './pages/settings.js?v=20261110-v5';
@@ -140,12 +140,39 @@ function paintLive(state) {
 }
 
 function startClock() {
+  const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  const setHand = (id, deg, len, tail = 3) => {
+    const line = $(id);
+    if (!line) return;
+    const rad = (deg * Math.PI) / 180;
+    const s = Math.sin(rad);
+    const c = Math.cos(rad);
+    line.removeAttribute('transform');
+    line.setAttribute('x1', (32 - tail * s).toFixed(2));
+    line.setAttribute('y1', (32 + tail * c).toFixed(2));
+    line.setAttribute('x2', (32 + len * s).toFixed(2));
+    line.setAttribute('y2', (32 - len * c).toFixed(2));
+  };
   const update = () => {
     const el = $('sysClock');
     if (!el) return;
     const d = new Date();
     const p = (n) => String(n).padStart(2, '0');
-    el.textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    const hh = d.getHours();
+    const mm = d.getMinutes();
+    const ss = d.getSeconds();
+    el.textContent = `${p(hh)}:${p(mm)}:${p(ss)}`;
+
+    const dateEl = $('sysDate');
+    if (dateEl) {
+      dateEl.textContent = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} · ${weeks[d.getDay()]}`;
+    }
+    const hDeg = ((hh % 12) + mm / 60 + ss / 3600) * 30;
+    const mDeg = (mm + ss / 60) * 6;
+    const sDeg = ss * 6;
+    setHand('clkHour', hDeg, 13, 2.5);
+    setHand('clkMin', mDeg, 18.5, 3);
+    setHand('clkSec', sDeg, 21, 4);
   };
   update();
   setInterval(update, 1000);

@@ -1,14 +1,21 @@
 import { api, store } from '../api.js';
 import {
-  esc, num, rel, fmtTime, statusText, defaultAvatar, initial, debounce,
+  esc, num, fmtTime, defaultAvatar, initial, debounce,
   paletteFor, museBadgeText, resolveMuseLiveAction,
 } from '../ui.js';
 
-const NW = 166;
+const NW = 186;
 const NH = 56;
-const NARROW = 640;
+const NARROW = 680;
 
-const state = { win: '24h', inferred: true, data: null };
+const state = {
+  win: '24h',
+  inferred: true,
+  layoutMode: 'wing', // 'wing' (对称双翼总线) | 'layer' (分层流向)
+  hideWeak: false,    // 是否精简弱连线 (<2条的非跨工位连线)
+  pinnedNode: null,   // 点击枢纽节点可锁定高亮
+  data: null,
+};
 let ctxRef = null;
 
 function displayNodeName(name, nodeMap) {
@@ -23,6 +30,7 @@ export async function mount(root, ctx) {
   ctxRef = ctx;
   state.win = store.settings?.default_window || '24h';
   state.inferred = store.settings?.show_inferred !== false;
+  state.pinnedNode = null;
 
   root.innerHTML = `
     <div class="pg-overview">
@@ -37,21 +45,27 @@ export async function mount(root, ctx) {
           <h2>全局链路与数据去向拓扑</h2>
           <span class="chip" id="graphStat">—</span>
           <span class="spacer"></span>
+          <div class="seg" id="layoutSeg" title="切换拓扑布局算法">
+            <button data-layout="wing" class="${state.layoutMode === 'wing' ? 'on' : ''}">双翼总线</button>
+            <button data-layout="layer" class="${state.layoutMode === 'layer' ? 'on' : ''}">分层流向</button>
+          </div>
           <div class="seg" id="winSeg">
-            ${Object.entries({ '1h': '1 小时', '24h': '24 小时', '7d': '7 天' }).map(([v, label]) =>
+            ${Object.entries({ '1h': '1H', '24h': '24H', '7d': '7D' }).map(([v, label]) =>
               `<button data-win="${v}" class="${v === state.win ? 'on' : ''}">${label}</button>`).join('')}
           </div>
+          <button class="btn ghost sm" id="weakBtn" title="隐藏仅有 1 条流量的弱连接，专注主力信道">精简弱边</button>
           <button class="btn ghost sm" id="inferBtn">推断边</button>
-          <button class="btn ghost sm" id="go3dBtn" title="切换到 3D 指挥室观看工位实时动作">🏛️ 3D 工位</button>
+          <button class="btn ghost sm" id="go3dBtn" title="切换到 3D 实时工位观看动作">🏛️ 3D 工位</button>
         </div>
         <div class="graph-body" id="graphBody">
           <div class="empty-state"><span>正在计算链路与去向…</span></div>
         </div>
         <div class="legend" id="legend">
-          <span><i></i>精确配对去向</span>
+          <span><i></i>中继核心直连</span>
+          <span><i style="border-color:#ff3f8e"></i>跨工位精确协同</span>
           <span><i class="dash"></i>时序推断去向</span>
-          <span><i class="faint"></i>中继直达（弱化）</span>
-          <span style="margin-left:auto;opacity:0.8">悬停节点高亮关联去向 · 点击节点进通信台</span>
+          <span><i style="border-color:#a855f7"></i>控制台通道</span>
+          <span style="margin-left:auto;opacity:0.85">悬停/点击节点高亮关联连线与精确条数 · 点击工位进通信台</span>
         </div>
       </section>
 
@@ -91,14 +105,27 @@ export async function mount(root, ctx) {
   const host = root.querySelector('#graphBody');
   const feedList = root.querySelector('#feedList');
   const inferBtn = root.querySelector('#inferBtn');
+  const weakBtn = root.querySelector('#weakBtn');
   const go3dBtn = root.querySelector('#go3dBtn');
 
-  const syncInfer = () => { inferBtn.textContent = state.inferred ? '推断流向 · 显示' : '推断流向 · 隐藏'; };
-  syncInfer();
+  const syncButtons = () => {
+    inferBtn.textContent = state.inferred ? '推断边 · 开' : '推断边 · 关';
+    weakBtn.classList.toggle('on', state.hideWeak);
+    weakBtn.textContent = state.hideWeak ? '精简模式 · 开' : '精简弱边';
+  };
+  syncButtons();
 
   if (go3dBtn) {
-    go3dBtn.onclick = () => ctx.go('office');
+    go3dBtn.onclick = () => ctx.go('workstations');
   }
+
+  root.querySelector('#layoutSeg').onclick = (event) => {
+    const btn = event.target.closest('button[data-layout]');
+    if (!btn || btn.dataset.layout === state.layoutMode) return;
+    state.layoutMode = btn.dataset.layout;
+    root.querySelectorAll('#layoutSeg button').forEach((b) => b.classList.toggle('on', b === btn));
+    if (state.data) drawGraph(host, state.data, ctxRef);
+  };
 
   root.querySelector('#winSeg').onclick = (event) => {
     const btn = event.target.closest('button[data-win]');
@@ -108,9 +135,15 @@ export async function mount(root, ctx) {
     load(root, host, feedList);
   };
 
+  weakBtn.onclick = () => {
+    state.hideWeak = !state.hideWeak;
+    syncButtons();
+    if (state.data) drawGraph(host, state.data, ctxRef);
+  };
+
   inferBtn.onclick = () => {
     state.inferred = !state.inferred;
-    syncInfer();
+    syncButtons();
     load(root, host, feedList);
   };
 
@@ -132,7 +165,7 @@ export async function mount(root, ctx) {
 
   const observer = new ResizeObserver(debounce(() => {
     if (state.data) drawGraph(host, state.data, ctxRef);
-  }, 180));
+  }, 160));
   observer.observe(host);
 
   await load(root, host, feedList);
@@ -147,16 +180,45 @@ export async function mount(root, ctx) {
 
 async function load(root, host, feedList) {
   try {
-    const [overview, lineage, events] = await Promise.all([
+    let [overview, lineage, events] = await Promise.all([
       api.overview(state.win),
       api.lineage(state.win, state.inferred),
       api.events(28),
     ]);
-    store.setAgents(overview.agents || []);
+    const agents = overview.agents || [];
+    store.setAgents(agents);
+
+    // 若当前窗口(如 1H/24H)暂无新消息但历史有信箱工位，自动回退拉取 7D 链路或按历史累计构建拓扑，避免画面空白
+    if ((!lineage.nodes || !lineage.nodes.length) && agents.length > 0) {
+      if (state.win !== '7d') {
+        const l7 = await api.lineage('7d', state.inferred).catch(() => null);
+        if (l7?.nodes?.length) lineage = l7;
+      }
+      if (!lineage.nodes || !lineage.nodes.length) {
+        const totalIn = agents.reduce((s, a) => s + (a.inbound || 0), 0);
+        const totalOut = agents.reduce((s, a) => s + (a.outbound || 0), 0);
+        lineage = {
+          nodes: [
+            { name: 'relay', display_name: '中继核心', virtual: true, inbound: totalIn, outbound: totalOut, volume: totalIn + totalOut, status: 'online' },
+            ...agents.map((a) => ({ ...a, volume: a.total || (a.inbound + a.outbound) || 0, virtual: false })),
+          ],
+          edges: agents
+            .filter((a) => (a.total || a.inbound || a.outbound) > 0)
+            .map((a) => ({
+              from: (a.inbound || 0) >= (a.outbound || 0) ? a.name : 'relay',
+              to: (a.inbound || 0) >= (a.outbound || 0) ? 'relay' : a.name,
+              count: Math.max(1, (a.inbound || 0) + (a.outbound || 0)),
+              confidence: 0.9,
+              inferred: false,
+            })),
+        };
+      }
+    }
+
     state.data = lineage;
     renderKpis(root, overview, lineage);
     drawGraph(host, lineage, ctxRef);
-    renderFlowDestinations(root, lineage, overview.agents || []);
+    renderFlowDestinations(root, lineage, agents);
     renderFeed(feedList, events.events || []);
     renderRank(root, overview);
     renderNotices(root);
@@ -205,7 +267,7 @@ function renderKpis(root, overview, lineage) {
     <div class="kpi${c.wide ? ' wide' : ''}"><div class="k">${esc(c.k)}</div>
       <div class="v">${esc(String(c.v))}</div><div class="s">${esc(c.s)}</div></div>`).join('');
   root.querySelector('#graphStat').textContent =
-    `${lineage.nodes.filter((n) => !n.virtual).length} 工位节点 · ${lineage.edges.length} 条去向链路 · 窗口 ${num(k.messages)} 条`;
+    `${lineage.nodes.filter((n) => !n.virtual).length} 工位 · ${lineage.edges.length} 链路 · ${num(k.messages)} 报文`;
 }
 
 function renderFlowDestinations(root, lineage, agents) {
@@ -224,16 +286,15 @@ function renderFlowDestinations(root, lineage, agents) {
     return;
   }
 
-  // 优先展示跨工位流向，再展示中继流向
   const sorted = [...edges].sort((a, b) => {
-    const ca = (a.from !== 'relay' && a.to !== 'relay') ? 1 : 0;
-    const cb = (b.from !== 'relay' && b.to !== 'relay') ? 1 : 0;
+    const ca = (a.from !== 'relay' && a.from !== 'console' && a.to !== 'relay' && a.to !== 'console') ? 1 : 0;
+    const cb = (b.from !== 'relay' && b.from !== 'console' && b.to !== 'relay' && b.to !== 'console') ? 1 : 0;
     if (ca !== cb) return cb - ca;
     return (b.count || 0) - (a.count || 0);
   });
 
   box.innerHTML = sorted.map((e) => {
-    const isCross = e.from !== 'relay' && e.to !== 'relay';
+    const isCross = e.from !== 'relay' && e.from !== 'console' && e.to !== 'relay' && e.to !== 'console';
     const srcName = displayNodeName(e.from, nodeMap);
     const dstName = displayNodeName(e.to, nodeMap);
     const tagCls = isCross ? (e.inferred ? 'warn' : 'out') : 'in';
@@ -327,123 +388,252 @@ function renderRank(root, overview) {
   });
 }
 
-/* ── 分层布局：宽屏横向、窄屏纵向 ── */
-function layerize(nodes, edges) {
-  const have = new Set();
-  const dir = [];
-  for (const e of edges) {
-    const rev = `${e.to}|${e.from}`;
-    if (have.has(rev)) continue;
-    have.add(`${e.from}|${e.to}`);
-    dir.push(e);
-  }
+/* ── 对称双翼总线布局（彻底解决左2右14倾斜交叉一团乱） ── */
+function buildWingLayout(nodes, edges, W, H) {
+  const pos = new Map();
+  const sideOf = new Map(); // 'hub' | 'left' | 'right'
 
-  const layer = new Map(nodes.map((n) => [n.name, 0]));
-  const indeg = new Map(nodes.map((n) => [n.name, 0]));
-  const adj = new Map();
-  for (const e of dir) {
-    if (indeg.has(e.to)) indeg.set(e.to, indeg.get(e.to) + 1);
-    if (!adj.has(e.from)) adj.set(e.from, []);
-    adj.get(e.from).push(e.to);
-  }
+  const hubs = nodes.filter((n) => n.virtual || n.name === 'relay' || n.name === 'console');
+  // 排序：relay 在上，console 在下
+  hubs.sort((a, b) => (a.name === 'relay' ? -1 : b.name === 'relay' ? 1 : (b.volume || 0) - (a.volume || 0)));
 
-  let roots = nodes.filter((n) => indeg.get(n.name) === 0).map((n) => n.name);
-  if (!roots.length && nodes.length) roots = [nodes[0].name];
+  const peers = nodes
+    .filter((n) => !hubs.includes(n))
+    .sort((a, b) => (b.volume || b.inbound + b.outbound || 0) - (a.volume || a.inbound + a.outbound || 0));
 
-  const queue = [...roots];
-  let guard = 0;
-  while (queue.length && guard < 800) {
-    guard += 1;
-    const cur = queue.shift();
-    for (const next of adj.get(cur) || []) {
-      const want = Math.min((layer.get(cur) || 0) + 1, 5);
-      if (want > (layer.get(next) || 0)) {
-        layer.set(next, want);
-        queue.push(next);
-      }
+  // 左右双翼蛇形/均衡分摊（高流量的交替分到左右两侧，让两翼流量负载均衡）
+  const leftNodes = [];
+  const rightNodes = [];
+  peers.forEach((n, i) => {
+    if (i % 2 === 0) {
+      leftNodes.push(n);
+      sideOf.set(n.name, 'left');
+    } else {
+      rightNodes.push(n);
+      sideOf.set(n.name, 'right');
     }
-  }
+  });
+  hubs.forEach((h) => sideOf.set(h.name, 'hub'));
 
-  const cols = new Map();
-  for (const n of nodes) {
-    const lv = layer.get(n.name) || 0;
-    if (!cols.has(lv)) cols.set(lv, []);
-    cols.get(lv).push(n);
-  }
-  const levels = [...cols.keys()].sort((a, b) => a - b);
-  for (const lv of levels) cols.get(lv).sort((a, b) => (b.volume || 0) - (a.volume || 0));
-  return { cols, levels };
+  const rowGap = 14;
+  const maxWing = Math.max(1, leftNodes.length, rightNodes.length);
+  const needH = Math.max(H, maxWing * (NH + rowGap) + 68);
+
+  const hubX = (W - NW) / 2;
+  const leftX = Math.max(24, Math.min(hubX - NW - 120, W * 0.05));
+  const rightX = Math.min(W - NW - 24, Math.max(hubX + NW + 120, W * 0.95 - NW));
+
+  // 居中放置中枢（relay / console 留出足够垂直间距，让两条总线明确分离）
+  const hubGap = Math.min(130, Math.max(72, (needH - hubs.length * NH) / (hubs.length + 1)));
+  const hubTotalH = hubs.length * NH + Math.max(0, hubs.length - 1) * hubGap;
+  const hubStartY = (needH - hubTotalH) / 2;
+  hubs.forEach((h, i) => {
+    pos.set(h.name, { x: hubX, y: hubStartY + i * (NH + hubGap), role: 'hub' });
+  });
+
+  const placeWing = (list, x, role) => {
+    if (!list.length) return;
+    const total = list.length * NH + (list.length - 1) * rowGap;
+    const startY = Math.max(26, (needH - total) / 2);
+    list.forEach((n, i) => {
+      pos.set(n.name, { x, y: startY + i * (NH + rowGap), role });
+    });
+  };
+  placeWing(leftNodes, leftX, 'left');
+  placeWing(rightNodes, rightX, 'right');
+
+  // 计算左右干线 X 坐标，确保绿线(relay) 与 紫粉线(console) 严格分层并行，绝不在中央交叉
+  const leftSpan = hubX - (leftX + NW);
+  const rightSpan = rightX - (hubX + NW);
+  const trunks = {
+    leftRelayX: leftX + NW + leftSpan * 0.42,
+    leftConsoleX: leftX + NW + leftSpan * 0.62,
+    rightRelayX: hubX + NW + rightSpan * 0.58,
+    rightConsoleX: hubX + NW + rightSpan * 0.38,
+    hubX,
+    leftX,
+    rightX,
+  };
+
+  return { pos, sideOf, contentH: needH, trunks };
 }
 
-function buildLayout(nodes, edges, W, H, vertical) {
+/* ── 分层布局：支持横向多列网格自适应，不把14个挤成一条长龙 ── */
+function buildLayerLayout(nodes, edges, W, H, vertical) {
   const pos = new Map();
-  if (!nodes.length) return { pos, contentH: H };
+  const sideOf = new Map();
+  if (!nodes.length) return { pos, sideOf, contentH: H, trunks: null };
 
-  const { cols, levels } = layerize(nodes, edges);
+  const hubs = nodes.filter((n) => n.virtual || n.name === 'relay' || n.name === 'console');
+  const peers = nodes
+    .filter((n) => !hubs.includes(n))
+    .sort((a, b) => (b.volume || 0) - (a.volume || 0));
 
-  if (!vertical) {
-    const padL = 48;
-    const padR = 48;
-    const padT = 32;
-    const padB = 28;
-    const usableW = Math.max(W - padL - padR - NW, 0);
-    const colGap = levels.length > 1 ? usableW / (levels.length - 1) : 0;
-    const usableH = Math.max(H - padT - padB - NH, 40);
-
-    levels.forEach((lv, i) => {
-      const list = cols.get(lv);
-      const x = levels.length > 1 ? padL + i * colGap : (W - NW) / 2;
-      const gap = list.length > 1 ? Math.min(usableH / (list.length - 1), 132) : 0;
-      const total = gap * (list.length - 1);
-      const startY = padT + (usableH - total) / 2;
-      list.forEach((n, j) => pos.set(n.name, { x, y: startY + j * gap }));
-    });
-    return { pos, contentH: H };
-  }
-
-  const padX = 12;
-  const padT = 14;
-  const usableW = Math.max(W - padX * 2, NW);
-  const perRow = Math.max(1, Math.floor(usableW / (NW + 10)));
-  let y = padT;
-
-  for (const lv of levels) {
-    const list = cols.get(lv);
-    for (let i = 0; i < list.length; i += perRow) {
-      const chunk = list.slice(i, i + perRow);
-      const free = Math.max(usableW - chunk.length * NW, 0);
-      const gap = chunk.length > 1 ? free / (chunk.length + 1) : 0;
-      chunk.forEach((n, j) => {
-        pos.set(n.name, {
-          x: padX + (chunk.length > 1 ? gap * (j + 1) + NW * j : (usableW - NW) / 2),
-          y,
+  if (vertical) {
+    const padX = 14;
+    let y = 16;
+    const cols = Math.max(1, Math.floor((W - padX * 2) / (NW + 12)));
+    const placeGrid = (list, role) => {
+      for (let i = 0; i < list.length; i += cols) {
+        const chunk = list.slice(i, i + cols);
+        const gap = chunk.length > 1 ? Math.max(10, (W - padX * 2 - chunk.length * NW) / (chunk.length - 1)) : 0;
+        const startX = chunk.length > 1 ? padX : (W - NW) / 2;
+        chunk.forEach((n, j) => {
+          pos.set(n.name, { x: startX + j * (NW + gap), y, role });
+          sideOf.set(n.name, role);
         });
-      });
-      y += NH + 26;
-    }
-    y += 12;
+        y += NH + 18;
+      }
+    };
+    placeGrid(hubs, 'hub');
+    y += 14;
+    placeGrid(peers, 'right');
+    return { pos, sideOf, contentH: Math.max(H, y + 18), trunks: null };
   }
-  return { pos, contentH: y + 10 };
+
+  // 宽屏分层：左列 Hub、右侧最多 2 列均衡工位矩阵，避免单列 14 行高耸拥挤
+  const rowGap = 14;
+  const colCount = peers.length > 9 ? 2 : 1;
+  const perCol = Math.ceil(peers.length / colCount);
+  const needH = Math.max(H, perCol * (NH + rowGap) + 64);
+
+  const hubX = Math.max(28, W * 0.06);
+  const hubGap = Math.min(130, Math.max(68, (needH - hubs.length * NH) / (hubs.length + 1)));
+  const hubStartY = (needH - (hubs.length * NH + Math.max(0, hubs.length - 1) * hubGap)) / 2;
+  hubs.forEach((h, i) => {
+    pos.set(h.name, { x: hubX, y: hubStartY + i * (NH + hubGap), role: 'hub' });
+    sideOf.set(h.name, 'hub');
+  });
+
+  const rightStartX = colCount === 2 ? Math.max(hubX + NW + 120, W * 0.43) : Math.max(hubX + NW + 160, W - NW - 48);
+  const colStep = colCount === 2 ? Math.max(NW + 44, (W - 28 - rightStartX) / 2) : 0;
+
+  for (let c = 0; c < colCount; c += 1) {
+    const chunk = peers.slice(c * perCol, (c + 1) * perCol);
+    const total = chunk.length * NH + Math.max(0, chunk.length - 1) * rowGap;
+    const startY = Math.max(26, (needH - total) / 2);
+    const x = Math.min(W - NW - 20, rightStartX + c * colStep);
+    chunk.forEach((n, i) => {
+      pos.set(n.name, { x, y: startY + i * (NH + rowGap), role: 'right' });
+      sideOf.set(n.name, 'right');
+    });
+  }
+
+  return { pos, sideOf, contentH: needH, trunks: null };
 }
 
 function edgeColor(edge, isLight, isAmber) {
-  const isCross = edge.from !== 'relay' && edge.to !== 'relay';
+  const isCross = edge.from !== 'relay' && edge.from !== 'console' && edge.to !== 'relay' && edge.to !== 'console';
   if (isCross && !edge.inferred) return '#ff3f8e';
   if (isCross && edge.inferred) return '#ffc21a';
+  if (edge.from === 'console' || edge.to === 'console') return '#a855f7';
   if (edge.confidence >= 0.85) return isAmber ? '#ffc46b' : (isLight ? '#2563eb' : '#45e6f5');
-  if (edge.confidence >= 0.5) return isAmber ? '#d99b43' : (isLight ? '#16a34a' : '#35e08a');
-  return isLight ? '#94a3b8' : '#52607a';
+  return isAmber ? '#d99b43' : (isLight ? '#16a34a' : '#35e08a');
 }
 
-function spreadOffset(j, n) {
-  if (n <= 1) return 0;
-  const step = Math.min(13, 46 / (n - 1));
-  return (j - (n - 1) / 2) * step;
+/* ── 生成平滑的正交圆角总线路径，零中央交叉大乱炖 ── */
+function buildBundledPath(a, b, edge, trunks, crossIdx) {
+  const isCross = edge.from !== 'relay' && edge.from !== 'console' && edge.to !== 'relay' && edge.to !== 'console';
+  const aIsHub = a.role === 'hub';
+  const bIsHub = b.role === 'hub';
+
+  // 1) 跨工位直连 (Muse ↔ Muse)：外侧优雅拱形弧线，完全绕开中间枢纽总线
+  if (isCross) {
+    if (a.role === b.role) {
+      const outerSide = a.role === 'left' ? -1 : 1;
+      const ax = a.role === 'left' ? a.x : a.x + NW;
+      const bx = b.role === 'left' ? b.x : b.x + NW;
+      const ay = a.y + NH / 2;
+      const by = b.y + NH / 2;
+      const bow = (36 + (crossIdx % 4) * 14) * outerSide;
+      const c1 = [ax + bow, ay];
+      const c2 = [bx + bow, by];
+      return {
+        d: `M${ax} ${ay} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${bx} ${by}`,
+        pillPos: [(ax + 3 * c1[0] + 3 * c2[0] + bx) / 8, (ay + 3 * c1[1] + 3 * c2[1] + by) / 8],
+        isCross: true,
+      };
+    }
+    const leftSide = b.x > a.x;
+    const x1 = leftSide ? a.x + NW : a.x;
+    const x2 = leftSide ? b.x : b.x + NW;
+    const y1 = a.y + NH / 2;
+    const y2 = b.y + NH / 2;
+    const archY = Math.min(y1, y2) - 48 - (crossIdx % 3) * 14;
+    const c1 = [x1 + (leftSide ? 70 : -70), archY];
+    const c2 = [x2 + (leftSide ? -70 : 70), archY];
+    return {
+      d: `M${x1} ${y1} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x2} ${y2}`,
+      pillPos: [(x1 + 3 * c1[0] + 3 * c2[0] + x2) / 8, (y1 + 3 * c1[1] + 3 * c2[1] + y2) / 8],
+      isCross: true,
+    };
+  }
+
+  // 2) 中继核心/控制台 ↔ 双翼工位：顺滑总线分支（先垂直贴干线，再水平入端口，胶囊停靠在入口直段绝不重叠！）
+  if (trunks && (aIsHub || bIsHub)) {
+    const hub = aIsHub ? a : b;
+    const peer = aIsHub ? b : a;
+    const isConsole = edge.from === 'console' || edge.to === 'console';
+    const goLeft = peer.role === 'left';
+
+    const hx = goLeft ? hub.x : hub.x + NW;
+    const hy = hub.y + NH / 2;
+    const px = goLeft ? peer.x + NW : peer.x;
+    // 同一个工位的两条线：relay 接卡片上部(36%)，console 接卡片下部(68%)，端口严格分离！
+    const py = peer.y + (isConsole ? NH * 0.68 : NH * 0.34);
+
+    const trunkX = goLeft
+      ? (isConsole ? trunks.leftConsoleX : trunks.leftRelayX)
+      : (isConsole ? trunks.rightConsoleX : trunks.rightRelayX);
+
+    // SVG 曲线起点/终点按 edge.from -> edge.to 方向，让箭头方向正确
+    const sx = aIsHub ? hx : px;
+    const sy = aIsHub ? hy : py;
+    const ex = aIsHub ? px : hx;
+    const ey = aIsHub ? py : hy;
+
+    const c1x = trunkX;
+    const c1y = sy;
+    const c2x = trunkX;
+    const c2y = ey;
+
+    // 悬停时显示的数值胶囊放在“靠近工位卡片内侧 28px”的端口直线上 -> 与邻居工位永不碰撞！
+    const pillX = goLeft ? px + 34 : px - 34;
+    const pillY = py;
+
+    return {
+      d: `M${sx} ${sy} C${c1x} ${c1y} ${c2x} ${c2y} ${ex} ${ey}`,
+      pillPos: [pillX, pillY],
+      isCross: false,
+      isConsole,
+    };
+  }
+
+  // 3) 分层流向模式 fallback
+  const goRight = b.x >= a.x;
+  const x1 = goRight ? a.x + NW : a.x;
+  const x2 = goRight ? b.x - 5 : b.x + NW + 5;
+  const y1 = a.y + NH / 2;
+  const y2 = b.y + NH / 2;
+  const dx = Math.max(36, Math.abs(x2 - x1) * 0.48) * (goRight ? 1 : -1);
+  const c1 = [x1 + dx, y1];
+  const c2 = [x2 - dx, y2];
+  // 标签同样放在 t=0.82 贴近目标节点处，避免中心扎堆
+  const t = 0.82;
+  const mt = 1 - t;
+  const px = mt * mt * mt * x1 + 3 * mt * mt * t * c1[0] + 3 * mt * t * t * c2[0] + t * t * t * x2;
+  const py = mt * mt * mt * y1 + 3 * mt * mt * t * c1[1] + 3 * mt * t * t * c2[1] + t * t * t * y2;
+  return {
+    d: `M${x1} ${y1} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x2} ${y2}`,
+    pillPos: [px, py],
+    isCross: false,
+    isConsole: edge.from === 'console' || edge.to === 'console',
+  };
 }
 
 function drawGraph(host, data, ctx) {
-  const W = Math.max(host.clientWidth || 560, 280);
-  const H = Math.max(host.clientHeight || 300, 200);
+  const W = Math.max(host.clientWidth || 640, 300);
+  const H = Math.max(host.clientHeight || 340, 220);
   const vertical = W < NARROW;
   const theme = document.documentElement.dataset.theme || 'cyber';
   const isLight = theme === 'ops';
@@ -457,19 +647,9 @@ function drawGraph(host, data, ctx) {
     return;
   }
 
-  const { pos, contentH } = buildLayout(data.nodes, data.edges, W, H, vertical);
-  const viewH = Math.max(H, contentH);
-
-  const neighbors = new Map();
-  for (const e of data.edges) {
-    if (!neighbors.has(e.from)) neighbors.set(e.from, new Set());
-    if (!neighbors.has(e.to)) neighbors.set(e.to, new Set());
-    neighbors.get(e.from).add(e.to);
-    neighbors.get(e.to).add(e.from);
-  }
-
+  // 合并双向边
   const seenPair = new Map();
-  const renderEdges = [];
+  const mergedEdges = [];
   for (const e of data.edges) {
     const key = [e.from, e.to].sort().join('\u0000');
     const prev = seenPair.get(key);
@@ -481,154 +661,143 @@ function drawGraph(host, data, ctx) {
     }
     const item = { ...e, bidir: false };
     seenPair.set(key, item);
-    renderEdges.push(item);
+    mergedEdges.push(item);
   }
 
-  const arriveGroups = new Map();
-  const leaveGroups = new Map();
-  renderEdges.forEach((e, i) => {
-    if (!arriveGroups.has(e.to)) arriveGroups.set(e.to, []);
-    arriveGroups.get(e.to).push(i);
-    if (!leaveGroups.has(e.from)) leaveGroups.set(e.from, []);
-    leaveGroups.get(e.from).push(i);
-  });
-  const arriveOff = new Map();
-  const leaveOff = new Map();
-  const sortKey = vertical ? (n) => pos.get(n)?.x || 0 : (n) => pos.get(n)?.y || 0;
-  for (const list of arriveGroups.values()) {
-    list.sort((i, j) => sortKey(renderEdges[i].from) - sortKey(renderEdges[j].from));
-    list.forEach((idx, j) => arriveOff.set(idx, spreadOffset(j, list.length)));
+  const renderEdges = state.hideWeak
+    ? mergedEdges.filter((e) => {
+        const isCross = e.from !== 'relay' && e.from !== 'console' && e.to !== 'relay' && e.to !== 'console';
+        return isCross || (e.count || 0) >= 2;
+      })
+    : mergedEdges;
+
+  // 统计每个节点的 中继/控制台/跨节点 往来条数，用于直接集成到工位卡片内展示
+  const peerEdgeMeta = new Map();
+  for (const e of mergedEdges) {
+    const addMeta = (peer, hub) => {
+      if (!peerEdgeMeta.has(peer)) peerEdgeMeta.set(peer, { relay: 0, console: 0, cross: 0 });
+      const m = peerEdgeMeta.get(peer);
+      if (hub === 'relay') m.relay += e.count || 0;
+      else if (hub === 'console') m.console += e.count || 0;
+      else m.cross += e.count || 0;
+    };
+    if (e.from === 'relay' || e.from === 'console') addMeta(e.to, e.from);
+    else if (e.to === 'relay' || e.to === 'console') addMeta(e.from, e.to);
+    else {
+      addMeta(e.from, 'cross');
+      addMeta(e.to, 'cross');
+    }
   }
-  for (const list of leaveGroups.values()) {
-    list.sort((i, j) => sortKey(renderEdges[i].to) - sortKey(renderEdges[j].to));
-    list.forEach((idx, j) => leaveOff.set(idx, spreadOffset(j, list.length)));
+
+  const useWing = state.layoutMode === 'wing' && !vertical;
+  const layout = useWing
+    ? buildWingLayout(data.nodes, renderEdges, W, H)
+    : buildLayerLayout(data.nodes, renderEdges, W, H, vertical);
+  const { pos, contentH, trunks } = layout;
+  const viewH = Math.max(H, contentH);
+
+  const neighbors = new Map();
+  for (const e of renderEdges) {
+    if (!neighbors.has(e.from)) neighbors.set(e.from, new Set());
+    if (!neighbors.has(e.to)) neighbors.set(e.to, new Set());
+    neighbors.get(e.from).add(e.to);
+    neighbors.get(e.to).add(e.from);
   }
 
   const parts = [];
-  parts.push(`<svg viewBox="0 0 ${W} ${viewH}" preserveAspectRatio="xMidYMid meet" role="img"
-    ${viewH > H ? `style="height:${viewH}px"` : ''}>
+  parts.push(`<svg viewBox="0 0 ${W} ${viewH}" preserveAspectRatio="xMidYMin meet" role="img"
+    style="height:${viewH}px">
     <defs>
-      <marker id="garrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <marker id="garrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse">
         <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
       </marker>
     </defs>`);
 
-  renderEdges.forEach((e, idx) => {
+  // 绘制双翼对称干道淡淡的导向轨线，帮助视觉对齐
+  if (trunks) {
+    const railCol = isLight ? 'rgba(15,23,42,0.08)' : 'rgba(148,163,184,0.12)';
+    parts.push(`<g pointer-events="none">
+      <line x1="${trunks.leftRelayX}" y1="24" x2="${trunks.leftRelayX}" y2="${viewH - 24}" stroke="${railCol}" stroke-dasharray="3 5"/>
+      <line x1="${trunks.rightRelayX}" y1="24" x2="${trunks.rightRelayX}" y2="${viewH - 24}" stroke="${railCol}" stroke-dasharray="3 5"/>
+    </g>`);
+  }
+
+  let crossIdx = 0;
+  const labelBg = isLight ? '#ffffff' : '#0b0f19';
+  const labelFg = isLight ? '#0f172a' : '#eef2ff';
+
+  renderEdges.forEach((e) => {
     const a = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a || !b) return;
 
-    let d = '';
-    let mid;
-    if (vertical) {
-      if (Math.abs(a.y - b.y) < 2) {
-        const leftSide = b.x >= a.x;
-        const x1 = a.x + (leftSide ? NW : 0);
-        const x2 = b.x + (leftSide ? NW : 0);
-        const y1 = a.y + NH / 2;
-        const y2 = b.y + NH / 2;
-        const c1 = [x1 + (leftSide ? 24 : -24), y1];
-        const c2 = [x2 + (leftSide ? 24 : -24), y2];
-        d = `M${x1} ${y1} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x2} ${y2}`;
-        mid = [(x1 + 3 * c1[0] + 3 * c2[0] + x2) / 8, (y1 + 3 * c1[1] + 3 * c2[1] + y2) / 8];
-      } else {
-        const down = b.y > a.y;
-        const x1 = a.x + NW / 2 + (leaveOff.get(idx) || 0);
-        const x2 = b.x + NW / 2 + (arriveOff.get(idx) || 0);
-        const y1 = a.y + (down ? NH : 0);
-        const y2 = b.y + (down ? 0 : NH);
-        const dy = Math.max(22, Math.abs(y2 - y1) / 2) * (down ? 1 : -1);
-        const c1 = [x1, y1 + dy];
-        const c2 = [x2, y2 - dy];
-        d = `M${x1} ${y1} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x2} ${y2}`;
-        mid = [(x1 + 3 * c1[0] + 3 * c2[0] + x2) / 8, (y1 + 3 * c1[1] + 3 * c2[1] + y2) / 8];
-      }
-    } else if (a.x === b.x) {
-      const x = a.x + NW;
-      const ay = a.y + NH / 2 + (leaveOff.get(idx) || 0);
-      const by = b.y + NH / 2 + (arriveOff.get(idx) || 0);
-      const c1 = [x + 62, ay];
-      const c2 = [x + 62, by];
-      d = `M${x} ${ay} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x} ${by}`;
-      mid = [(x + 3 * c1[0] + 3 * c2[0] + x) / 8, (ay + 3 * c1[1] + 3 * c2[1] + by) / 8];
-    } else if (b.x > a.x) {
-      const x1 = a.x + NW;
-      const x2 = b.x - 7;
-      const ay = a.y + NH / 2 + (leaveOff.get(idx) || 0);
-      const by = b.y + NH / 2 + (arriveOff.get(idx) || 0);
-      const dx = Math.max(34, (x2 - x1) / 2);
-      const c1 = [x1 + dx, ay];
-      const c2 = [x2 - dx, by];
-      d = `M${x1} ${ay} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x2} ${by}`;
-      mid = [(x1 + 3 * c1[0] + 3 * c2[0] + x2) / 8, (ay + 3 * c1[1] + 3 * c2[1] + by) / 8];
-    } else {
-      const x1 = a.x + NW / 2 + (leaveOff.get(idx) || 0);
-      const x2 = b.x + NW / 2 + (arriveOff.get(idx) || 0);
-      const lift = Math.min(a.y, b.y) > 74 ? 54 : -54;
-      const y1 = a.y + (lift > 0 ? 0 : NH);
-      const y2 = b.y + (lift > 0 ? 0 : NH);
-      const c1 = [x1, a.y + lift];
-      const c2 = [x2, b.y + lift];
-      d = `M${x1} ${y1} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${x2} ${y2}`;
-      mid = [(x1 + 3 * c1[0] + 3 * c2[0] + x2) / 8, (y1 + 3 * c1[1] + 3 * c2[1] + y2) / 8];
-    }
+    const geo = buildBundledPath(a, b, e, trunks, crossIdx);
+    if (geo.isCross) crossIdx += 1;
 
-    const isRelayDirect = e.from === 'relay' || e.to === 'relay';
-    const isConsoleEdge = e.from === 'console' || e.to === 'console';
-    const width = (isRelayDirect ? 1.05 : 1.5) + Math.min(e.count, 9) * (isRelayDirect ? 0.22 : 0.35);
-    const dash = e.inferred ? ' stroke-dasharray="5 4"' : '';
+    const strokeCol = edgeColor(e, isLight, isAmber);
+    const width = geo.isCross
+      ? (2.0 + Math.min(e.count, 8) * 0.35)
+      : (1.25 + Math.min(e.count, 8) * 0.25);
+
+    // 平时柔和不抢戏（控制台虚线轻盈、中继清晰、跨节点最亮）；悬停或选中相关节点时 100% 点亮
+    const baseOpacity = geo.isCross ? 0.94 : (geo.isConsole ? 0.36 : 0.62);
+    const dash = (e.inferred && !geo.isCross) ? ' stroke-dasharray="4 4"' : '';
     const markers = e.bidir
       ? ' marker-start="url(#garrow)" marker-end="url(#garrow)"'
       : ' marker-end="url(#garrow)"';
-    const strokeCol = edgeColor(e, isLight, isAmber);
-    const edgeClass = `gedge ${e.inferred ? '' : 'gedge-flow'}${isRelayDirect ? ' gedge-relay' : ''}${isConsoleEdge ? ' gedge-console' : ''}`;
-    parts.push(`<path class="${edgeClass}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"
-      d="${d}" fill="none" stroke="${strokeCol}" stroke-width="${width.toFixed(2)}"${dash}${markers}
-      opacity="${e.inferred ? 0.7 : (isRelayDirect ? 0.34 : 0.95)}"/>`);
 
-    // 所有 >= 1 条的流向边均展示清晰的数量胶囊标签
-    // 中继直达的单条边数量太多时不逐条贴标签，避免总览被 1 条胶囊淹没；悬停仍可看路径。
-    if ((e.count >= 2 || !isRelayDirect || e.bidir) && !vertical) {
-      const labelBg = isLight ? '#ffffff' : '#0b0f19';
-      const labelFg = isLight ? '#0f172a' : '#eef2ff';
+    parts.push(`<path class="gedge ${geo.isCross || (!e.inferred && e.count >= 3) ? 'gedge-flow' : ''}"
+      data-from="${esc(e.from)}" data-to="${esc(e.to)}" data-baseop="${baseOpacity}"
+      d="${geo.d}" fill="none" stroke="${strokeCol}" stroke-width="${width.toFixed(2)}"${dash}${markers}
+      opacity="${baseOpacity}"/>`);
+
+    // 标签胶囊：跨工位弧线常驻展示，中继/控制台线仅在 >= 4 条时微显，悬停关联节点时全部完整浮现 -> 彻底告别中间重叠一团！
+    const showDefaultLbl = !vertical && (geo.isCross || e.count >= 6);
+    if (e.count >= 1 && !vertical) {
       const txt = `${e.count}条${e.bidir ? '⇄' : ''}`;
-      const pillW = Math.max(34, txt.length * 7.5 + 10);
+      const pillW = Math.max(34, txt.length * 7.2 + 10);
       parts.push(`
-        <g class="gedge-lbl" data-from="${esc(e.from)}" data-to="${esc(e.to)}">
-          <rect x="${(mid[0] - pillW / 2).toFixed(1)}" y="${(mid[1] - 9).toFixed(1)}" width="${pillW}" height="17" rx="8.5"
-            fill="${labelBg}" stroke="${strokeCol}" stroke-width="1.1" opacity="0.94"/>
-          <text x="${mid[0].toFixed(1)}" y="${(mid[1] + 3).toFixed(1)}" text-anchor="middle"
+        <g class="gedge-lbl" data-from="${esc(e.from)}" data-to="${esc(e.to)}"
+          data-default="${showDefaultLbl ? '1' : '0'}"
+          style="opacity:${showDefaultLbl ? 0.92 : 0};pointer-events:none">
+          <rect x="${(geo.pillPos[0] - pillW / 2).toFixed(1)}" y="${(geo.pillPos[1] - 8.5).toFixed(1)}" width="${pillW}" height="17" rx="8.5"
+            fill="${labelBg}" stroke="${strokeCol}" stroke-width="1.1"/>
+          <text x="${geo.pillPos[0].toFixed(1)}" y="${(geo.pillPos[1] + 3).toFixed(1)}" text-anchor="middle"
             font-size="9.5" font-weight="700" fill="${labelFg}"
             font-family="JetBrains Mono,ui-monospace,monospace">${txt}</text>
         </g>`);
     }
   });
 
+  // 绘制节点卡片（内置 中/控/协 端口数字，重名节点附短标识）
   for (const n of data.nodes) {
     const p = pos.get(n.name);
     if (!p) continue;
-    const virtual = n.virtual;
-    const label = (n.display_name || n.name);
+    const virtual = n.virtual || n.name === 'relay' || n.name === 'console';
+    const label = n.display_name || n.name;
     let shown = label;
-    if (label.length > (vertical ? 9 : 8)) shown = `${label.slice(0, vertical ? 9 : 8).trimEnd()}…`;
+    if (label.length > 9) shown = `${label.slice(0, 9).trimEnd()}…`;
+
     const fill = isLight
-      ? (virtual ? '#f1f5f9' : '#ffffff')
-      : (virtual ? '#0d1320' : '#111827');
+      ? (virtual ? '#eef4ff' : '#ffffff')
+      : (virtual ? '#0d1628' : '#111827');
     const liveAct = virtual ? null : resolveMuseLiveAction(n, customMap, null, nowSec);
     const stroke = isLight
-      ? (virtual ? '#94a3b8' : '#cbd5e1')
-      : (virtual ? '#38bdf8' : (liveAct?.meta?.color || (isAmber ? 'rgba(255,196,107,0.38)' : 'rgba(69,230,245,0.38)')));
+      ? (virtual ? '#3b82f6' : '#cbd5e1')
+      : (virtual ? '#45e6f5' : (liveAct?.meta?.color || (isAmber ? 'rgba(255,196,107,0.42)' : 'rgba(69,230,245,0.4)')));
     const textMain = isLight ? '#0f172a' : '#eef2ff';
     const clipId = `clip-${Math.random().toString(36).slice(2, 8)}`;
     const av = n.avatar || defaultAvatar(n.name);
     const pal = paletteFor(n.name);
-    const badge = museBadgeText(n.name);
-    const cx = p.x + 25;
+    const badge = museBadgeText(n.name) || (!virtual && n.name !== label ? n.name.slice(0, 4) : '');
+    const cx = p.x + 24;
     const cy = p.y + NH / 2;
+    const pm = peerEdgeMeta.get(n.name);
 
-    parts.push(`<g class="gnode${virtual ? ' virtual' : ''}" data-name="${esc(n.name)}">
+    const isPinned = state.pinnedNode === n.name;
+    parts.push(`<g class="gnode${virtual ? ' virtual' : ''}${isPinned ? ' pinned' : ''}" data-name="${esc(n.name)}">
       <rect class="box" x="${p.x}" y="${p.y}" width="${NW}" height="${NH}" rx="9"
-        fill="${fill}" stroke="${stroke}" stroke-width="1.4"/>`);
+        fill="${fill}" stroke="${isPinned ? '#ffc21a' : stroke}" stroke-width="${isPinned ? 2.2 : (virtual ? 1.8 : 1.35)}"/>`);
 
     if (av) {
       parts.push(`<circle cx="${cx}" cy="${cy}" r="15" fill="${isLight ? '#eef4ff' : '#1e293b'}"/>
@@ -642,9 +811,9 @@ function drawGraph(host, data, ctx) {
     }
 
     if (badge) {
-      parts.push(`<rect x="${cx - 18}" y="${cy - 18}" width="19" height="12" rx="4" fill="#2563eb"/>
-        <text x="${cx - 8.5}" y="${cy - 9.5}" text-anchor="middle" font-size="8" font-weight="700" fill="#fff"
-          font-family="JetBrains Mono,monospace">${esc(badge)}</text>`);
+      parts.push(`<rect x="${cx - 18}" y="${cy - 19}" width="21" height="12" rx="4" fill="#2563eb"/>
+        <text x="${cx - 7.5}" y="${cy - 10.5}" text-anchor="middle" font-size="7.5" font-weight="700" fill="#fff"
+          font-family="JetBrains Mono,monospace">${esc(badge.slice(0, 4))}</text>`);
     }
 
     const dotColor = { online: '#35e08a', active: '#45e6f5', idle: '#ffc21a', silent: '#64748b', empty: '#475569' }[n.status] || '#64748b';
@@ -652,44 +821,73 @@ function drawGraph(host, data, ctx) {
 
     const inCol = isLight ? '#2563eb' : '#45e6f5';
     const outCol = isLight ? '#16a34a' : '#35e08a';
-    const actIcon = liveAct ? `${liveAct.meta.icon} ` : (virtual ? '💠 ' : '');
-    parts.push(`<text x="${p.x + 48}" y="${p.y + 21}" font-size="12" font-weight="700" fill="${textMain}">${actIcon}${esc(shown)}</text>
-      <text x="${p.x + 48}" y="${p.y + 39}" font-size="10" font-family="JetBrains Mono,ui-monospace,monospace">
-        <tspan fill="${inCol}" font-weight="600">↓${n.inbound}</tspan>
+    const actIcon = liveAct ? `${liveAct.meta.icon} ` : (n.name === 'relay' ? '💠 ' : '🎛 ');
+
+    // 第一行：动作图标 + 名称
+    parts.push(`<text x="${p.x + 46}" y="${p.y + 20}" font-size="11.5" font-weight="700" fill="${textMain}">${actIcon}${esc(shown)}</text>`);
+
+    // 第二行：收/发总数 + (对于工位)内置去向速览 `中x·控y`
+    let routeSub = '';
+    if (!virtual && pm) {
+      const rStr = pm.relay ? `中${pm.relay}` : '';
+      const cStr = pm.console ? `控${pm.console}` : '';
+      const xStr = pm.cross ? `协${pm.cross}` : '';
+      const joined = [rStr, cStr, xStr].filter(Boolean).join('·');
+      if (joined) routeSub = ` <tspan fill="#94a3b8">| ${esc(joined)}</tspan>`;
+    } else if (virtual) {
+      routeSub = ` <tspan fill="#94a3b8">(总${n.volume || (n.inbound + n.outbound)})</tspan>`;
+    }
+
+    parts.push(`<text x="${p.x + 46}" y="${p.y + 39}" font-size="9.5" font-family="JetBrains Mono,ui-monospace,monospace">
+        <tspan fill="${inCol}" font-weight="700">↓${n.inbound}</tspan>
         <tspan fill="#64748b">·</tspan>
-        <tspan fill="${outCol}" font-weight="600">↑${n.outbound}</tspan>
-        <tspan fill="#94a3b8"> (Σ${n.volume || (n.inbound + n.outbound)})</tspan>
+        <tspan fill="${outCol}" font-weight="700">↑${n.outbound}</tspan>${routeSub}
       </text>
-      <title>${esc(label)} · 收 ${n.inbound} / 发 ${n.outbound} / 共 ${n.volume || 0} 条${liveAct ? ` · 当前动作: ${liveAct.actionText}` : ''}</title>
+      <title>${esc(label)} (${esc(n.name)}) · ↓收 ${n.inbound} / ↑发 ${n.outbound}${liveAct ? ` · 当前动作: ${liveAct.actionText}` : ''}</title>
     </g>`);
   }
 
   parts.push('</svg>');
   host.innerHTML = parts.join('');
 
+  const applyFocus = (name) => {
+    if (!name) {
+      host.querySelectorAll('.gedge').forEach((edge) => { edge.style.opacity = edge.dataset.baseop || '0.62'; });
+      host.querySelectorAll('.gedge-lbl').forEach((lbl) => { lbl.style.opacity = lbl.dataset.default === '1' ? '0.92' : '0'; });
+      host.querySelectorAll('.gnode').forEach((other) => other.classList.remove('dim'));
+      return;
+    }
+    const related = neighbors.get(name) || new Set();
+    host.querySelectorAll('.gedge').forEach((edge) => {
+      const on = edge.dataset.from === name || edge.dataset.to === name;
+      edge.style.opacity = on ? '1' : '0.06';
+    });
+    host.querySelectorAll('.gedge-lbl').forEach((lbl) => {
+      const on = lbl.dataset.from === name || lbl.dataset.to === name;
+      lbl.style.opacity = on ? '1' : '0';
+    });
+    host.querySelectorAll('.gnode').forEach((other) => {
+      const otherName = other.dataset.name;
+      other.classList.toggle('dim', otherName !== name && !related.has(otherName));
+    });
+  };
+
+  if (state.pinnedNode) {
+    applyFocus(state.pinnedNode);
+  }
+
   host.querySelectorAll('.gnode').forEach((g) => {
     const name = g.dataset.name;
-    const related = neighbors.get(name) || new Set();
-
-    g.addEventListener('mouseenter', () => {
-      host.querySelectorAll('.gedge, .gedge-lbl').forEach((edge) => {
-        const on = edge.dataset.from === name || edge.dataset.to === name;
-        edge.style.opacity = on ? '1' : '0.08';
-      });
-      host.querySelectorAll('.gnode').forEach((other) => {
-        const otherName = other.dataset.name;
-        other.classList.toggle('dim', otherName !== name && !related.has(otherName));
-      });
+    g.addEventListener('mouseenter', () => applyFocus(name));
+    g.addEventListener('mouseleave', () => applyFocus(state.pinnedNode));
+    g.addEventListener('click', () => {
+      if (g.classList.contains('virtual')) {
+        state.pinnedNode = state.pinnedNode === name ? null : name;
+        drawGraph(host, state.data, ctx);
+      } else if (ctx) {
+        ctx.go('chat', { agent: name });
+      }
     });
-
-    g.addEventListener('mouseleave', () => {
-      host.querySelectorAll('.gedge, .gedge-lbl').forEach((edge) => { edge.style.opacity = ''; });
-      host.querySelectorAll('.gnode').forEach((other) => other.classList.remove('dim'));
-    });
-
-    if (!g.classList.contains('virtual') && ctx) {
-      g.addEventListener('click', () => ctx.go('chat', { agent: name }));
-      g.style.cursor = 'pointer';
-    }
+    g.style.cursor = 'pointer';
   });
 }

@@ -152,12 +152,24 @@ nav.nav a.on svg{opacity:1;color:var(--blue)}
 .tactical-frame{display:block;width:100%;height:100%;min-height:0;border:0;background:#07080d}
 
 .side-clock{
-  margin:4px 10px 8px;padding:8px 12px;border-radius:var(--r-sm);
-  background:var(--surface2);border:1px solid var(--line);
-  display:flex;flex-direction:column;align-items:flex-start;gap:3px;
+  margin:4px 10px 8px;padding:10px 12px;border-radius:var(--r-md);
+  background:var(--surface2);border:1px solid var(--line2);
+  display:flex;align-items:center;gap:11px;box-shadow:inset 0 0 18px rgba(69,230,245,.04);
 }
-.side-clock .sc-label{font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--ink3);line-height:1.2}
-.side-clock b{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--blue);font-variant-numeric:tabular-nums;letter-spacing:.08em;line-height:1.2}
+.side-clock .sc-dial{flex:none;overflow:hidden;filter:drop-shadow(0 0 8px var(--blue-soft))}
+.side-clock .sc-ring{fill:none;stroke:var(--blue);stroke-width:1.4;stroke-dasharray:5 3;opacity:.65}
+.side-clock .sc-face{fill:var(--bg);stroke:var(--line2);stroke-width:1.2}
+.side-clock .sc-ticks line{stroke:var(--ink3);stroke-width:1.1;stroke-linecap:round;opacity:.65}
+.side-clock .sc-ticks line.major{stroke:var(--blue);stroke-width:1.7;opacity:1}
+.side-clock .sc-hand{stroke-linecap:round}
+.side-clock .sc-hand.hour{stroke:var(--ink);stroke-width:2.6}
+.side-clock .sc-hand.min{stroke:var(--blue);stroke-width:2}
+.side-clock .sc-hand.sec{stroke:var(--green);stroke-width:1.3}
+.side-clock .sc-pivot{fill:var(--amber);stroke:var(--bg);stroke-width:1.2}
+.side-clock .sc-meta{display:flex;flex-direction:column;gap:2px;min-width:0}
+.side-clock .sc-label{font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--ink3);line-height:1.15}
+.side-clock b{font-family:var(--mono);font-size:16px;font-weight:800;color:var(--blue);font-variant-numeric:tabular-nums;letter-spacing:.06em;line-height:1.2}
+.side-clock .sc-date{font-family:var(--mono);font-size:9.5px;color:var(--ink2);letter-spacing:.03em;line-height:1.15}
 
 .side-user{border-top:1px solid var(--line);padding:11px 12px;display:flex;align-items:center;gap:9px;background:var(--surface2)}
 .side-user .av{width:30px;height:30px;border-radius:6px;background:var(--blue-soft);border:1px solid var(--line2);color:var(--blue-deep);display:grid;place-items:center;font-family:var(--mono);font-size:12px;font-weight:700;flex:none}
@@ -214,6 +226,7 @@ nav.nav a.on svg{opacity:1;color:var(--blue)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.ghost{background:var(--surface2);color:var(--ink2);border:1px solid var(--line2);font-weight:500}
 .btn.ghost:hover{border-color:var(--blue);color:var(--ink);background:var(--blue-soft);box-shadow:none}
+.btn.ghost.on{border-color:var(--blue);color:var(--blue);background:var(--blue-soft);font-weight:700}
 .btn.sm{padding:5px 10px;font-size:11.5px}
 .btn.danger{background:var(--red-soft);color:var(--red);border:1px solid var(--red)}
 
