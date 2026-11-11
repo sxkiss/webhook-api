@@ -1,21 +1,28 @@
 import { api, store, startStream, stopStream, onUnauthorized, ApiError } from './api.js';
 import { icon, esc, initial, toast, modal } from './ui.js';
-import * as loginPage from './pages/login.js';
-import * as overviewPage from './pages/overview.js';
-import * as chatPage from './pages/chat.js';
-import * as officePage from './pages/office.js';
+import * as loginPage from './pages/login.js?v=20261110-v5';
+import * as overviewPage from './pages/overview.js?v=20261111-v9';
+import * as chatPage from './pages/chat.js?v=20261111-platforms';
+import * as officePage from './pages/office.js?v=20261111-platforms';
 import * as tacticalPage from './pages/tactical.js?v=20261110-v1';
-import * as agentsPage from './pages/agents.js';
-import * as settingsPage from './pages/settings.js';
+import * as workstationsPage from './pages/workstations.js?v=20261111-v9';
+import * as agentsPage from './pages/agents.js?v=20261110-v5';
+import * as registryPage from './pages/registry.js?v=20261111-platforms';
+import * as settingsPage from './pages/settings.js?v=20261110-v5';
 
 const ROUTES = [
-  { id: 'overview', label: '总览 · 链路', icon: 'overview', title: '总览与链路', sub: '一屏看清所有信箱与消息流向' },
-  { id: 'chat', label: '通信台', icon: 'chat', title: '通信台', sub: '和任意信箱直接对话' },
-  { id: 'office', label: '中继办公室', icon: 'office', title: '中继办公室', sub: '谁在活跃、谁静默、消息怎么走' },
-  { id: 'tactical', label: '战术大屏', icon: 'overview', title: 'HQ 战术大屏', sub: '内嵌 HQ 主题 · 与工作台共用正式实时数据' },
-  { id: 'agents', label: '信箱与成员', icon: 'agents', title: '信箱与成员', sub: '自动检测的信箱与它们的形象' },
-  { id: 'settings', label: '设置与权限', icon: 'settings', title: '设置与权限', sub: '基础设置、账号与角色' },
+  { id: 'overview',     code: '总览看板', label: '总览 · 链路', icon: 'overview',    title: '总览与链路态势',     sub: '实时中继报文统计 · 节点拓扑与数据去向配对' },
+  { id: 'chat',         code: '双向终端', label: '通信台',     icon: 'chat',        title: '全媒体双向通信台',   sub: '信箱实时收发 · 动作定义与去向透视' },
+  { id: 'office',       code: '3D 拓扑',  label: '3D 节点拓扑', icon: 'office',      title: '3D 节点链路拓扑',   sub: '中继核心与信箱环形沙盘 · 点击节点上方展示详情' },
+  { id: 'tactical',     code: 'HQ 大屏',  label: '战术大屏',     icon: 'overview',    title: 'HQ 战术大屏',         sub: '嵌入式 HQ 主题 · 与 3D 拓扑共用同一套实时数据' },
+  { id: 'workstations', code: '3D 工位',  label: '3D 实时工位', icon: 'workstation', title: '3D 实时办公工位',   sub: '独立 3D 工位阵列 · 实时观看每个 Muse 动作姿态与定义' },
+  { id: 'agents',       code: '成员单元', label: '信箱与成员', icon: 'agents',      title: '信箱成员与动作',     sub: '自动发现信箱 · 形象标注 · 收发数量与去向' },
+  { id: 'registry',     code: '路由矩阵', label: '注册与路由', icon: 'route',       title: 'Muse 注册与路由矩阵', sub: 'Muse 通道分配 · 外部会话绑定与解析测试' },
+  { id: 'settings',     code: '系统控制', label: '设置与权限', icon: 'settings',    title: '系统设置与权限控制', sub: '基础外观 · Muse 动作定义矩阵 · 规则与账号权限' },
 ];
+
+const THEMES = ['cyber', 'amber', 'ops'];
+const THEME_NAMES = { cyber: '赛博深色', amber: '黑金总部', ops: '纸面工程' };
 
 const MODULES = {
   login: loginPage,
@@ -23,7 +30,9 @@ const MODULES = {
   chat: chatPage,
   office: officePage,
   tactical: tacticalPage,
+  workstations: workstationsPage,
   agents: agentsPage,
+  registry: registryPage,
   settings: settingsPage,
 };
 
@@ -31,15 +40,17 @@ const $ = (id) => document.getElementById(id);
 let cleanup = null;
 let currentRoute = '';
 let booted = false;
-const THEMES = ['cyber', 'amber', 'ops'];
 
-function applyTheme(theme) {
-  const next = THEMES.includes(theme) ? theme : 'cyber';
-  document.documentElement.dataset.theme = next;
-  try { localStorage.setItem('muse_viz_theme', next); } catch { /* ignore */ }
+export function applyTheme(theme, silent = false) {
+  const t = THEMES.includes(theme) ? theme : 'cyber';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('muse_viz_theme', t); } catch { /* ignore */ }
   document.querySelectorAll('#themeSwitch button').forEach((btn) => {
-    btn.classList.toggle('on', btn.dataset.themeOpt === next);
+    btn.classList.toggle('on', btn.dataset.themeOpt === t);
   });
+  store.theme = t;
+  store.emit('theme', t);
+  if (!silent) toast(`主题已切换：${THEME_NAMES[t] || t}`);
 }
 
 export const ctx = {
@@ -48,6 +59,7 @@ export const ctx = {
   go: (route, params) => navigate(route, params),
   toast,
   modal,
+  applyTheme,
   async reloadUser() {
     const data = await api.me();
     store.user = data.user;
@@ -55,6 +67,19 @@ export const ctx = {
     paintUser();
     return data.user;
   },
+  async onLoginSuccess() {
+    const data = await api.me();
+    store.user = data.user;
+    store.settings = data.settings;
+    paintUser();
+    startStream();
+    location.hash = '#/overview';
+    render('overview');
+    if (store.user.must_change && store.user.via !== 'bearer') {
+      setTimeout(forcePasswordChange, 300);
+    }
+  },
+  openPasswordModal,
   async saveSettings(patch) {
     const data = await api.saveSettings(patch);
     store.settings = data.settings;
@@ -65,7 +90,11 @@ export const ctx = {
 /* ── 导航 ── */
 function buildNav() {
   $('nav').innerHTML = ROUTES.map(
-    (r) => `<a href="#/${r.id}" data-route="${r.id}">${icon(r.icon)}<span>${esc(r.label)}</span></a>`,
+    (r, idx) => `<a href="#/${r.id}" data-route="${r.id}">
+      ${icon(r.icon)}
+      <span>${esc(r.label)}</span>
+      <em class="nav-idx">0${idx + 1}</em>
+    </a>`,
   ).join('');
 }
 
@@ -83,7 +112,11 @@ function paintUser() {
     <div class="av">${esc(initial(user.username))}</div>
     <div class="meta"><b>${esc(user.username)}</b><span>${esc(user.role_label || user.role)}</span></div>
     ${badge}
+    ${user.via === 'bearer' ? '' : `<button class="iconbtn" id="pwBtn" title="修改密码">${icon('key', 14)}</button>`}
     <button class="iconbtn" id="logoutBtn" title="退出登录">${icon('logout', 14)}</button>`;
+  if ($('pwBtn')) {
+    $('pwBtn').onclick = () => openPasswordModal();
+  }
   $('logoutBtn').onclick = async () => {
     try { await api.logout(); } catch { /* 忽略 */ }
     store.user = null;
@@ -92,18 +125,57 @@ function paintUser() {
     navigate('login');
   };
 
-  const name = store.settings?.site_name || 'Webhook';
+  const name = store.settings?.site_name || 'MUSE OPS';
   $('brandName').textContent = name;
-  document.title = `${name} · 工作台`;
+  document.title = `${name} · 战术工作台`;
 }
 
 function paintLive(state) {
   const map = {
-    open: ['online', '实时连接中'],
-    reconnecting: ['idle', '连接中断，重连中'],
+    open: ['online', '实时流在线'],
+    reconnecting: ['idle', '正在重连…'],
   };
-  const [dot, text] = map[state] || ['online', '实时连接中'];
+  const [dot, text] = map[state] || ['online', '实时流在线'];
   $('liveState').innerHTML = `<span class="dot ${dot}"></span>${esc(text)}`;
+}
+
+function startClock() {
+  const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  const setHand = (id, deg, len, tail = 3) => {
+    const line = $(id);
+    if (!line) return;
+    const rad = (deg * Math.PI) / 180;
+    const s = Math.sin(rad);
+    const c = Math.cos(rad);
+    line.removeAttribute('transform');
+    line.setAttribute('x1', (32 - tail * s).toFixed(2));
+    line.setAttribute('y1', (32 + tail * c).toFixed(2));
+    line.setAttribute('x2', (32 + len * s).toFixed(2));
+    line.setAttribute('y2', (32 - len * c).toFixed(2));
+  };
+  const update = () => {
+    const el = $('sysClock');
+    if (!el) return;
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const hh = d.getHours();
+    const mm = d.getMinutes();
+    const ss = d.getSeconds();
+    el.textContent = `${p(hh)}:${p(mm)}:${p(ss)}`;
+
+    const dateEl = $('sysDate');
+    if (dateEl) {
+      dateEl.textContent = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} · ${weeks[d.getDay()]}`;
+    }
+    const hDeg = ((hh % 12) + mm / 60 + ss / 3600) * 30;
+    const mDeg = (mm + ss / 60) * 6;
+    const sDeg = ss * 6;
+    setHand('clkHour', hDeg, 13, 2.5);
+    setHand('clkMin', mDeg, 18.5, 3);
+    setHand('clkSec', sDeg, 21, 4);
+  };
+  update();
+  setInterval(update, 1000);
 }
 
 function closeDrawer() {
@@ -133,10 +205,12 @@ async function render(route, params = null) {
     $('app').classList.add('login-mode');
     $('pageTitle').textContent = '登录';
     $('pageSub').textContent = '';
+    if ($('pageTag')) $('pageTag').textContent = '身份验证';
     $('liveState').innerHTML = '';
   } else {
     $('app').classList.remove('login-mode');
     const meta = ROUTES.find((r) => r.id === route);
+    if ($('pageTag')) $('pageTag').textContent = meta?.code || '总览看板';
     $('pageTitle').textContent = meta?.title || '';
     $('pageSub').textContent = meta?.sub || '';
     paintLive('open');
@@ -196,24 +270,28 @@ function onHashChange() {
   render(route, params);
 }
 
-/* ── 强制改密 ── */
-function forcePasswordChange() {
+/* ── 改密与强制改密 ── */
+function openPasswordModal() {
+  const must = Boolean(store.user?.must_change);
   modal({
-    title: '先设置一个新密码',
-    okText: '保存并继续',
+    title: must ? '先设置一个新密码' : '修改登录密码',
+    okText: '保存密码',
     body: `
-      <p style="margin:0 0 12px;color:var(--ink2)">当前账号仍在用初始密码（即 API Key），继续使用有风险。</p>
+      ${must ? '<p style="margin:0 0 12px;color:var(--ink2)">当前账号仍在用初始密码（即 API Key），继续使用有风险。</p>' : ''}
+      ${must ? '' : '<label class="field"><span>当前密码</span><input type="password" id="opw" autocomplete="current-password"></label>'}
       <label class="field"><span>新密码（至少 8 位）</span><input type="password" id="np1" autocomplete="new-password"></label>
-      <label class="field"><span>再输一次</span><input type="password" id="np2" autocomplete="new-password"></label>
+      <label class="field"><span>再输一次新密码</span><input type="password" id="np2" autocomplete="new-password"></label>
       <div id="npErr" style="color:var(--red);font-size:12px"></div>`,
     onOk: async (wrap) => {
+      const oldPw = must ? '' : (wrap.querySelector('#opw')?.value || '');
       const a = wrap.querySelector('#np1').value;
       const b = wrap.querySelector('#np2').value;
       const err = wrap.querySelector('#npErr');
-      if (a.length < 8) { err.textContent = '密码至少 8 位'; return false; }
+      if (!must && !oldPw) { err.textContent = '请输入当前密码'; return false; }
+      if (a.length < 8) { err.textContent = '新密码至少 8 位'; return false; }
       if (a !== b) { err.textContent = '两次输入不一致'; return false; }
       try {
-        await api.changePassword(store.user.via === 'bearer' ? '' : '', a);
+        await api.changePassword(oldPw, a);
         store.user.must_change = false;
         toast('密码已更新');
         render(currentRoute || 'overview');
@@ -226,16 +304,38 @@ function forcePasswordChange() {
   });
 }
 
+function forcePasswordChange() {
+  openPasswordModal();
+}
+
 /* ── 启动 ── */
 async function boot() {
   let savedTheme = 'cyber';
   try { savedTheme = localStorage.getItem('muse_viz_theme') || 'cyber'; } catch { /* ignore */ }
-  applyTheme(savedTheme);
-  $('themeSwitch')?.addEventListener('click', (event) => {
-    const button = event.target.closest('button[data-theme-opt]');
-    if (button) applyTheme(button.dataset.themeOpt);
-  });
+  applyTheme(savedTheme, true);
+
   buildNav();
+  startClock();
+
+  if ($('themeSwitch')) {
+    $('themeSwitch').onclick = (e) => {
+      const btn = e.target.closest('button[data-theme-opt]');
+      if (!btn) return;
+      applyTheme(btn.dataset.themeOpt);
+    };
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 't' || e.key === 'T') {
+      const tag = (e.target?.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const cur = document.documentElement.dataset.theme || 'cyber';
+      const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+      applyTheme(next);
+    }
+  });
+
   $('menuBtn').innerHTML = icon('menu', 16);
   $('menuBtn').onclick = () => ($('sidebar').classList.contains('open') ? closeDrawer() : openDrawer());
 
@@ -273,7 +373,6 @@ async function boot() {
 
     const startRoute = parseHash() || 'overview';
     const route = startRoute === 'login' ? 'overview' : startRoute;
-    // 登录态下落在 #/login 要把地址栏纠正过来，否则刷新一次又回登录页
     if (location.hash !== `#/${route}`) history.replaceState(null, '', `#/${route}`);
     render(route);
 
